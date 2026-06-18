@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional
 
 from agent.transports.codex_app_server_session import CodexAppServerSession
 
+from .approval import CodexApprovalBridge
 from .formatting import (
     format_failure,
     format_run_failure,
@@ -23,7 +24,9 @@ from .registry import CodexTaskRegistry
 from .records import make_task_record
 from .runtime_config import (
     PLAN_PROMPT_PREFIX,
+    codex_app_server_config_overrides,
     load_codex_cfg,
+    normalize_sandbox_mode,
     read_codex_config_model,
 )
 from .session_pool import CodexSessionPool, LiveSession
@@ -86,6 +89,7 @@ class CodexCommandService:
                 prompt = PLAN_PROMPT_PREFIX + prompt
             new_session = subcommand in {"run", "new"} or self._sessions.peek(task_key) is None
             return await self._run(
+                request,
                 task_key,
                 prompt,
                 workspace=self._workspace_for(request, task_key),
@@ -97,6 +101,7 @@ class CodexCommandService:
             if not prompt:
                 return CommandResult("Usage: /codex continue <task>", status="usage")
             return await self._run(
+                request,
                 task_key,
                 prompt,
                 workspace=self._workspace_for(request, task_key),
@@ -308,6 +313,7 @@ class CodexCommandService:
 
     async def _run(
         self,
+        request: CommandRequest,
         task_key: str,
         prompt: str,
         *,
@@ -317,6 +323,7 @@ class CodexCommandService:
     ) -> CommandResult:
         return await run_blocking(
             self._run_sync,
+            request,
             task_key,
             prompt,
             workspace or os.getcwd(),
@@ -326,13 +333,21 @@ class CodexCommandService:
 
     def _run_sync(
         self,
+        request: CommandRequest,
         task_key: str,
         prompt: str,
         workspace: str,
         new_session: bool,
         plan_mode: bool,
     ) -> CommandResult:
-        live = self._sessions.get(task_key, workspace, new_session=new_session)
+        codex_cfg = load_codex_cfg()
+        config_overrides = codex_app_server_config_overrides(codex_cfg)
+        live = self._sessions.get(
+            task_key,
+            workspace,
+            new_session=new_session,
+            config_overrides=config_overrides,
+        )
         if live is None:
             return CommandResult(
                 "No live Codex app-server session found for this chat. "
@@ -345,9 +360,33 @@ class CodexCommandService:
                 "Use `/codex stop` or wait for it to finish.",
                 status="busy",
             )
+        bridge = CodexApprovalBridge(
+            session_key=request.approval_session_key or task_key,
+            notify=request.approval_notify,
+        )
+        approval = str(codex_cfg.get("approval_policy") or "on-request")
+        sandbox = normalize_sandbox_mode(str(codex_cfg.get("sandbox") or "workspace-write"))
+        approval_callback = (
+            (lambda *_args, **_kwargs: "session")
+            if approval == "never" or sandbox == "danger-full-access"
+            else bridge.callback
+        )
         try:
-            return self._run_locked(live, task_key, prompt, workspace, new_session, plan_mode)
+            with bridge:
+                if hasattr(live.session, "set_approval_callback"):
+                    live.session.set_approval_callback(approval_callback)
+                return self._run_locked(
+                    live,
+                    task_key,
+                    prompt,
+                    workspace,
+                    new_session,
+                    plan_mode,
+                    codex_cfg,
+                )
         finally:
+            if hasattr(live.session, "set_approval_callback"):
+                live.session.set_approval_callback(None)
             live.active_task_id = ""
             live.lock.release()
 
@@ -359,10 +398,11 @@ class CodexCommandService:
         workspace: str,
         new_session: bool,
         plan_mode: bool,
+        codex_cfg: dict[str, Any] | None = None,
     ) -> CommandResult:
-        codex_cfg = load_codex_cfg()
+        codex_cfg = codex_cfg if isinstance(codex_cfg, dict) else load_codex_cfg()
         model = str(codex_cfg.get("model") or read_codex_config_model())
-        sandbox = str(codex_cfg.get("sandbox") or "workspace-write")
+        sandbox = normalize_sandbox_mode(str(codex_cfg.get("sandbox") or "workspace-write"))
         approval = str(codex_cfg.get("approval_policy") or "on-request")
         try:
             thread_id = live.session.ensure_started()

@@ -9,8 +9,6 @@ from typing import Callable, Optional
 
 from agent.transports.codex_app_server_session import CodexAppServerSession
 
-from .runtime_config import get_approval_callback
-
 logger = logging.getLogger("gateway.run")
 
 
@@ -40,6 +38,7 @@ class CodexSessionPool:
         workspace: str,
         *,
         new_session: bool,
+        config_overrides: list[str] | None = None,
     ) -> LiveSession | None:
         with self._lock:
             existing = self._sessions.get(task_key)
@@ -52,7 +51,7 @@ class CodexSessionPool:
                 return None
             session = self._session_factory(
                 cwd=workspace,
-                approval_callback=get_approval_callback(),
+                config_overrides=list(config_overrides or []),
             )
             live = LiveSession(session=session, workspace=workspace, lock=threading.Lock())
             self._sessions[task_key] = live

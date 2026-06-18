@@ -37,6 +37,30 @@ def load_codex_cfg() -> dict[str, Any]:
         return {}
 
 
+def normalize_sandbox_mode(value: str) -> str:
+    raw = (value or "").strip().lower()
+    aliases = {
+        "workspace": "workspace-write",
+        "workspace_write": "workspace-write",
+        "workspace-write": "workspace-write",
+        "read": "read-only",
+        "readonly": "read-only",
+        "read-only": "read-only",
+        "danger": "danger-full-access",
+        "danger-full-access": "danger-full-access",
+        "full": "danger-full-access",
+        "full-access": "danger-full-access",
+        "yolo": "danger-full-access",
+    }
+    return aliases.get(raw, "workspace-write")
+
+
+def codex_app_server_config_overrides(cfg: dict[str, Any] | None = None) -> list[str]:
+    codex_cfg = cfg if isinstance(cfg, dict) else load_codex_cfg()
+    sandbox = normalize_sandbox_mode(str(codex_cfg.get("sandbox") or "workspace-write"))
+    return [f'sandbox_mode="{sandbox}"']
+
+
 def get_approval_callback():
     try:
         from tools.terminal_tool import _get_approval_callback

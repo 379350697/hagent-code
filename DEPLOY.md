@@ -56,10 +56,19 @@ request = CommandRequest(
     thread_id=str(getattr(source, "thread_id", "") or ""),
     text=event.get_command_args().strip() if event else "",
     workspace=getattr(self, "working_directory", None) or os.getcwd(),
+    approval_session_key=self._session_key_for_source(source) if source else "",
+    approval_chat_id=str(getattr(source, "chat_id", "") or ""),
+    approval_thread_metadata=self._thread_metadata_for_source(source) if source else {},
+    approval_notify=codex_approval_notify_callback,
 )
 result = await get_codex_command_service().handle(request)
 return result.text
 ```
+
+`codex_approval_notify_callback` must register with Hermes' existing approval
+queue by sending the approval prompt to the originating adapter. Prefer
+`adapter.send_exec_approval(...)` when available; otherwise send a text fallback
+that tells the user to reply with `/approve` or `/deny`.
 
 Recommended Discord adapter behavior:
 
@@ -80,6 +89,15 @@ Recommended Discord adapter behavior:
 
 Telegram should dispatch the same text commands through the existing Hermes
 slash-command path. It should not import Discord adapter code.
+
+Required Hermes transport integration:
+
+- `CodexAppServerSession` must accept `config_overrides: list[str]` and pass
+  them to `CodexAppServerClient(extra_args=...)`.
+- It must expose `set_approval_callback(callback)` so each `/codex` turn can
+  bind a fresh gateway approval context.
+- When Codex approval is unavailable, denied, or times out, surface that as a
+  turn error instead of silently declining and letting the model guess.
 
 ## Workspace Selection
 
@@ -133,6 +151,17 @@ TELEGRAM_HOME=...
 ```
 
 Do not commit secrets.
+
+Codex app-server runtime config lives under `codex_app_server`:
+
+```yaml
+codex_app_server:
+  sandbox: workspace-write   # workspace-write | read-only | danger-full-access
+  approval_policy: on-request # on-request | never
+```
+
+The control plane maps `sandbox` to Codex `-c sandbox_mode="..."`. `never`
+should only be used by the explicit `/codex permissions danger` path.
 
 ## Validate
 

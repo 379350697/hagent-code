@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,10 @@ class CommandRequest:
     thread_id: str = ""
     text: str = ""
     workspace: str = ""
+    approval_session_key: str = ""
+    approval_chat_id: str = ""
+    approval_thread_metadata: dict[str, Any] = field(default_factory=dict)
+    approval_notify: Callable[[dict[str, Any]], None] | None = None
 
 
 @dataclass(frozen=True)

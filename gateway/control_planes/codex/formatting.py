@@ -8,6 +8,12 @@ from typing import Any
 def format_failure(prefix: str, error: Any) -> str:
     message = str(error or "unknown error")
     lowered = message.lower()
+    if "codex approval bridge unavailable" in lowered:
+        return message
+    if "codex approval denied" in lowered or "codex approval timed out" in lowered:
+        return message
+    if "bwrap" in lowered or "bubblewrap" in lowered or "sandbox" in lowered:
+        return f"Codex sandbox failed: {message}"
     if "timed out" in lowered or "timeout" in lowered:
         return f"Codex task timed out: {message}"
     return f"{prefix}: {message}"

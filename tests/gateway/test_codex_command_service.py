@@ -10,9 +10,10 @@ from gateway.control_planes.codex import (
 
 
 class FakeCodexSession:
-    def __init__(self, *, cwd, approval_callback=None):
+    def __init__(self, *, cwd, approval_callback=None, config_overrides=None):
         self.cwd = cwd
         self.approval_callback = approval_callback
+        self.config_overrides = list(config_overrides or [])
         self.thread_id = f"thread-{cwd.rsplit('/', 1)[-1] or 'root'}"
         self.interrupted = False
         self.closed = False
@@ -40,10 +41,38 @@ class FakeCodexSession:
     def close(self):
         self.closed = True
 
+    def set_approval_callback(self, callback):
+        self.approval_callback = callback
+
 
 class TimeoutCodexSession(FakeCodexSession):
     def ensure_started(self):
         raise TimeoutError("thread/start timed out after 15s")
+
+
+class ApprovalCodexSession(FakeCodexSession):
+    last_instance = None
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        ApprovalCodexSession.last_instance = self
+
+    def run_turn(self, user_input):
+        if self.approval_callback is not None:
+            try:
+                self.approval_callback("touch file.txt", "Codex requests exec in /repo")
+            except Exception as exc:
+                self.turns += 1
+                self.inputs.append(user_input)
+                return SimpleNamespace(
+                    final_text="",
+                    error=str(exc),
+                    interrupted=False,
+                    should_retire=False,
+                    turn_id=f"turn-{self.turns}",
+                    token_usage_total={},
+                )
+        return super().run_turn(user_input)
 
 
 class MemoryRegistry:
@@ -216,6 +245,95 @@ async def test_plan_continues_live_session_when_present(tmp_path, monkeypatch) -
     assert live.session.inputs[0] == "implement x"
     assert "add tests" in live.session.inputs[1]
     assert live.session.inputs[1].startswith("Create a detailed implementation plan first.")
+
+
+@pytest.mark.asyncio
+async def test_codex_approval_bridge_resolves_exec_request(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, session_factory=ApprovalCodexSession)
+    seen = []
+
+    def notify(approval_data):
+        seen.append(approval_data)
+        from tools.approval import resolve_gateway_approval
+
+        assert resolve_gateway_approval("approval-session", "once") == 1
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="new write file",
+            workspace="/repo",
+            approval_session_key="approval-session",
+            approval_notify=notify,
+        )
+    )
+
+    assert result.status == "completed"
+    assert seen
+    assert seen[0]["command"] == "touch file.txt"
+
+
+@pytest.mark.asyncio
+async def test_codex_approval_bridge_unavailable_is_explicit(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch, session_factory=ApprovalCodexSession)
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="new write file",
+            workspace="/repo",
+            approval_session_key="approval-session",
+        )
+    )
+
+    assert result.status == "failed"
+    assert "Codex approval bridge unavailable" in result.text
+
+
+@pytest.mark.asyncio
+async def test_codex_sandbox_config_is_passed_to_app_server(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch, session_factory=ApprovalCodexSession)
+    from gateway.control_planes.codex import service as service_mod
+
+    monkeypatch.setattr(
+        service_mod,
+        "load_codex_cfg",
+        lambda: {"sandbox": "readonly", "approval_policy": "on-request"},
+    )
+
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new inspect", workspace="/repo")
+    )
+
+    assert ApprovalCodexSession.last_instance is not None
+    assert 'sandbox_mode="read-only"' in ApprovalCodexSession.last_instance.config_overrides
+
+
+@pytest.mark.asyncio
+async def test_codex_danger_mode_auto_approves_without_notify(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch, session_factory=ApprovalCodexSession)
+    from gateway.control_planes.codex import service as service_mod
+
+    monkeypatch.setattr(
+        service_mod,
+        "load_codex_cfg",
+        lambda: {"sandbox": "danger-full-access", "approval_policy": "never"},
+    )
+
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new write", workspace="/repo")
+    )
+
+    assert result.status == "completed"
+    assert 'sandbox_mode="danger-full-access"' in ApprovalCodexSession.last_instance.config_overrides
 
 
 @pytest.mark.asyncio
