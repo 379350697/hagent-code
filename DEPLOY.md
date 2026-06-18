@@ -75,6 +75,28 @@ Recommended Discord adapter behavior:
 Telegram should dispatch the same text commands through the existing Hermes
 slash-command path. It should not import Discord adapter code.
 
+## Workspace Selection
+
+The control plane supports per-platform/chat/thread workspace selection:
+
+```text
+/codex workspace
+/codex workspace current
+/codex workspace set <number-or-path>
+/codex workspace clear
+```
+
+`/codex workspace` lists discovered local git repositories. Discovery checks
+`HERMES_CODEX_WORKSPACE_ROOTS` first, then `CODEX_WORKSPACE_ROOTS`. Both use
+the platform path separator, for example:
+
+```bash
+export HERMES_CODEX_WORKSPACE_ROOTS="/home/wl/projects:/home/wl/.hermes"
+```
+
+If neither variable is set, discovery scans the Hermes workspace, `HERMES_HOME`,
+and the user home with common heavy directories skipped.
+
 ## Runtime Config
 
 Use platform-specific environment variables in Hermes:

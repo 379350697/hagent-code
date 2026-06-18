@@ -81,6 +81,21 @@ class MemoryRegistry:
         return records[:limit]
 
 
+class MemoryWorkspaceStore:
+    def __init__(self):
+        self.values = {}
+
+    def get(self, task_key):
+        return self.values.get(task_key, "")
+
+    def set(self, task_key, workspace):
+        self.values[task_key] = workspace
+        return workspace
+
+    def clear(self, task_key):
+        self.values.pop(task_key, None)
+
+
 def _service(tmp_path, monkeypatch, session_factory=FakeCodexSession):
     from gateway.control_planes.codex import service as service_mod
 
@@ -88,8 +103,16 @@ def _service(tmp_path, monkeypatch, session_factory=FakeCodexSession):
     monkeypatch.setattr(service_mod, "read_codex_config_model", lambda: "gpt-5.5")
     return CodexCommandService(
         registry=MemoryRegistry(),
+        workspace_store=MemoryWorkspaceStore(),
         session_factory=session_factory,
     )
+
+
+def _make_git_repo(path):
+    git_dir = path / ".git"
+    git_dir.mkdir(parents=True)
+    (path / "README.md").write_text("test\n", encoding="utf-8")
+    return path
 
 
 def test_task_key_is_platform_scoped() -> None:
@@ -159,3 +182,57 @@ async def test_codex_start_timeout_is_reported_without_platform_failure(
     assert result.status == "failed"
     assert "Codex task timed out" in result.text
     assert result.diagnostics["phase"] == "thread/start"
+
+
+@pytest.mark.asyncio
+async def test_workspace_list_and_selection_drive_new_session(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch)
+    repo_a = _make_git_repo(tmp_path / "repo-a")
+    repo_b = _make_git_repo(tmp_path / "repo-b")
+    monkeypatch.setenv("HERMES_CODEX_WORKSPACE_ROOTS", str(tmp_path))
+
+    listing = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="workspace")
+    )
+
+    assert listing.status == "ok"
+    assert str(repo_a) in listing.text
+    assert str(repo_b) in listing.text
+
+    selected = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="workspace set 2")
+    )
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new inspect workspace")
+    )
+
+    assert selected.status == "ok"
+    assert str(repo_b) in selected.text
+    assert f"Workspace: {repo_b}" in result.text
+
+
+@pytest.mark.asyncio
+async def test_workspace_selection_is_platform_scoped(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch)
+    repo = _make_git_repo(tmp_path / "same-chat-repo")
+
+    discord_selected = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text=f"workspace set {repo}",
+            workspace="/default",
+        )
+    )
+    telegram_current = await service.handle(
+        CommandRequest(
+            platform="telegram",
+            chat_id="42",
+            text="workspace current",
+            workspace="/default",
+        )
+    )
+
+    assert discord_selected.status == "ok"
+    assert str(repo) in discord_selected.text
+    assert "Default: /default" in telegram_current.text

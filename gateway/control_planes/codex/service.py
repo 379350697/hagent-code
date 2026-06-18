@@ -28,6 +28,11 @@ from .runtime_config import (
 )
 from .session_pool import CodexSessionPool, LiveSession
 from .task_keys import build_codex_task_key, task_id_for
+from .workspaces import (
+    WorkspaceSelectionStore,
+    discover_git_workspaces,
+    workspace_scan_roots,
+)
 
 logger = logging.getLogger("gateway.run")
 
@@ -39,11 +44,13 @@ class CodexCommandService:
         self,
         *,
         registry: Any = None,
+        workspace_store: Any = None,
         session_factory: Optional[Callable[..., CodexAppServerSession]] = None,
     ) -> None:
         if registry is None:
             registry = CodexTaskRegistry()
         self._registry = registry
+        self._workspace_store = workspace_store or WorkspaceSelectionStore()
         self._sessions = CodexSessionPool(session_factory=session_factory)
 
     async def handle(self, request: CommandRequest) -> CommandResult:
@@ -57,8 +64,10 @@ class CodexCommandService:
             return self._status(task_key)
         if subcommand in {"sessions", "tasks", "ls", "list"}:
             return self._sessions_status(request)
+        if subcommand in {"workspace", "workspaces", "cwd", "repo"}:
+            return self._workspace_command(request, task_key, rest)
         if subcommand in {"diff", "git"}:
-            return self._diff(task_key, request.workspace)
+            return self._diff(task_key, self._workspace_for(request, task_key))
         if subcommand in {"stop", "interrupt", "cancel"}:
             return self._stop(task_key)
         if subcommand in {"permissions", "permission", "perms"}:
@@ -78,7 +87,7 @@ class CodexCommandService:
             return await self._run(
                 task_key,
                 prompt,
-                workspace=request.workspace,
+                workspace=self._workspace_for(request, task_key),
                 new_session=True,
                 plan_mode=(subcommand == "plan"),
             )
@@ -89,16 +98,117 @@ class CodexCommandService:
             return await self._run(
                 task_key,
                 prompt,
-                workspace=request.workspace,
+                workspace=self._workspace_for(request, task_key),
                 new_session=False,
                 plan_mode=False,
             )
 
         return CommandResult(
             "Usage: /codex new <task> | continue <task> | status | sessions | "
-            "diff | stop | plan <task> | permissions <auto|workspace|readonly|danger>",
+            "workspace [list|set <path-or-number>|current|clear] | diff | stop | "
+            "plan <task> | permissions <auto|workspace|readonly|danger>",
             status="usage",
         )
+
+    def _workspace_for(self, request: CommandRequest, task_key: str) -> str:
+        selected = self._workspace_store.get(task_key)
+        return selected or request.workspace or os.getcwd()
+
+    def _workspace_command(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        raw_args: str,
+    ) -> CommandResult:
+        args = raw_args.strip()
+        parts = args.split(maxsplit=1)
+        action = parts[0].lower() if parts else "list"
+        value = parts[1].strip() if len(parts) > 1 else ""
+
+        if action in {"current", "show"}:
+            current = self._workspace_for(request, task_key)
+            selected = self._workspace_store.get(task_key)
+            prefix = "Selected" if selected else "Default"
+            return CommandResult(f"Codex workspace\n{prefix}: {current}", status="ok")
+
+        if action in {"clear", "reset", "unset"}:
+            self._workspace_store.clear(task_key)
+            return CommandResult(
+                f"Codex workspace cleared. Default: {request.workspace or os.getcwd()}",
+                status="ok",
+            )
+
+        if action in {"set", "use", "select"}:
+            if not value:
+                return CommandResult(
+                    "Usage: /codex workspace set <path-or-number>",
+                    status="usage",
+                )
+            return self._set_workspace(request, task_key, value)
+
+        if action not in {"list", "ls"} and args:
+            return self._set_workspace(request, task_key, args)
+
+        return self._list_workspaces(request, task_key)
+
+    def _list_workspaces(self, request: CommandRequest, task_key: str) -> CommandResult:
+        roots = workspace_scan_roots(request.workspace)
+        entries = discover_git_workspaces(roots)
+        current = self._workspace_for(request, task_key)
+        lines = ["Codex workspaces"]
+        lines.append(f"Current: {current}")
+        if not entries:
+            lines.append("No git repositories found.")
+            lines.append(
+                "Set HERMES_CODEX_WORKSPACE_ROOTS with colon-separated roots "
+                "to widen discovery."
+            )
+            return CommandResult("\n".join(lines), status="not_found")
+        for index, entry in enumerate(entries[:20], start=1):
+            marker = "*" if os.path.abspath(entry.path) == os.path.abspath(current) else " "
+            lines.append(f"{marker} {index}. {entry.path}")
+        if len(entries) > 20:
+            lines.append(f"...and {len(entries) - 20} more")
+        lines.append("Use `/codex workspace set <number-or-path>`.")
+        return CommandResult(
+            "\n".join(lines),
+            status="ok",
+            diagnostics={"workspaces": [entry.path for entry in entries]},
+        )
+
+    def _set_workspace(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        value: str,
+    ) -> CommandResult:
+        workspace = value.strip()
+        if workspace.isdigit():
+            entries = discover_git_workspaces(workspace_scan_roots(request.workspace))
+            index = int(workspace)
+            if index < 1 or index > len(entries):
+                return CommandResult(
+                    f"Codex workspace not found: index {index}",
+                    status="not_found",
+                )
+            workspace = entries[index - 1].path
+        workspace = os.path.abspath(os.path.expanduser(workspace))
+        if not os.path.isdir(workspace):
+            return CommandResult(
+                f"Codex workspace not found: {workspace}",
+                status="not_found",
+            )
+        if not os.path.exists(os.path.join(workspace, ".git")):
+            digest = git_digest(workspace)
+            if not digest.get("available"):
+                return CommandResult(
+                    f"Codex workspace is not a git repository: {workspace}",
+                    status="failed",
+                )
+            repo_root = str(digest.get("repoRoot") or workspace)
+            workspace = repo_root
+        selected = self._workspace_store.set(task_key, workspace)
+        return CommandResult(f"Codex workspace selected:\n{selected}", status="ok")
 
     def _status(self, task_key: str) -> CommandResult:
         record = self._registry.get(task_key=task_key)
