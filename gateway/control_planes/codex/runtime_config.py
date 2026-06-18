@@ -58,7 +58,7 @@ def normalize_sandbox_mode(value: str) -> str:
 def codex_app_server_config_overrides(cfg: dict[str, Any] | None = None) -> list[str]:
     codex_cfg = cfg if isinstance(cfg, dict) else load_codex_cfg()
     sandbox = normalize_sandbox_mode(str(codex_cfg.get("sandbox") or "workspace-write"))
-    return [f'sandbox_mode="{sandbox}"']
+    return ["-c", f'sandbox_mode="{sandbox}"']
 
 
 def get_approval_callback():

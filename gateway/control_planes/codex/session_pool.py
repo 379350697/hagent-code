@@ -16,6 +16,7 @@ logger = logging.getLogger("gateway.run")
 class LiveSession:
     session: CodexAppServerSession
     workspace: str
+    config_overrides: list[str]
     lock: threading.Lock
     active_task_id: str = ""
 
@@ -40,20 +41,35 @@ class CodexSessionPool:
         new_session: bool,
         config_overrides: list[str] | None = None,
     ) -> LiveSession | None:
+        desired_config = list(config_overrides or [])
         with self._lock:
             existing = self._sessions.get(task_key)
-            if new_session and existing is not None:
+            retired_existing = False
+            if (
+                existing is not None
+                and (
+                    new_session
+                    or existing.workspace != workspace
+                    or existing.config_overrides != desired_config
+                )
+            ):
                 self.retire(task_key, existing)
                 existing = None
+                retired_existing = True
             if existing is not None:
                 return existing
-            if not new_session:
+            if not new_session and not retired_existing:
                 return None
             session = self._session_factory(
                 cwd=workspace,
-                config_overrides=list(config_overrides or []),
+                config_overrides=desired_config,
             )
-            live = LiveSession(session=session, workspace=workspace, lock=threading.Lock())
+            live = LiveSession(
+                session=session,
+                workspace=workspace,
+                config_overrides=desired_config,
+                lock=threading.Lock(),
+            )
             self._sessions[task_key] = live
             return live
 

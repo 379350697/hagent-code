@@ -75,6 +75,14 @@ class ApprovalCodexSession(FakeCodexSession):
         return super().run_turn(user_input)
 
 
+class CountingCodexSession(FakeCodexSession):
+    instances = []
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        CountingCodexSession.instances.append(self)
+
+
 class MemoryRegistry:
     def __init__(self):
         self.records = {}
@@ -312,7 +320,10 @@ async def test_codex_sandbox_config_is_passed_to_app_server(
     )
 
     assert ApprovalCodexSession.last_instance is not None
-    assert 'sandbox_mode="read-only"' in ApprovalCodexSession.last_instance.config_overrides
+    assert ApprovalCodexSession.last_instance.config_overrides == [
+        "-c",
+        'sandbox_mode="read-only"',
+    ]
 
 
 @pytest.mark.asyncio
@@ -333,7 +344,62 @@ async def test_codex_danger_mode_auto_approves_without_notify(
     )
 
     assert result.status == "completed"
-    assert 'sandbox_mode="danger-full-access"' in ApprovalCodexSession.last_instance.config_overrides
+    assert ApprovalCodexSession.last_instance.config_overrides == [
+        "-c",
+        'sandbox_mode="danger-full-access"',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_workspace_change_recreates_live_session(tmp_path, monkeypatch) -> None:
+    CountingCodexSession.instances = []
+    service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
+    repo_a = _make_git_repo(tmp_path / "repo-a")
+    repo_b = _make_git_repo(tmp_path / "repo-b")
+
+    first = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace=str(repo_a))
+    )
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text=f"workspace set {repo_b}")
+    )
+    second = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="plan second", workspace=str(repo_a))
+    )
+
+    assert first.status == "completed"
+    assert second.status == "completed"
+    assert len(CountingCodexSession.instances) == 2
+    assert CountingCodexSession.instances[0].cwd == str(repo_a)
+    assert CountingCodexSession.instances[1].cwd == str(repo_b)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_config_change_recreates_live_session(tmp_path, monkeypatch) -> None:
+    CountingCodexSession.instances = []
+    service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
+    from gateway.control_planes.codex import service as service_mod
+
+    cfg = {"sandbox": "workspace-write", "approval_policy": "on-request"}
+    monkeypatch.setattr(service_mod, "load_codex_cfg", lambda: dict(cfg))
+
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace="/repo")
+    )
+    cfg["sandbox"] = "readonly"
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="plan second", workspace="/repo")
+    )
+
+    assert len(CountingCodexSession.instances) == 2
+    assert CountingCodexSession.instances[0].config_overrides == [
+        "-c",
+        'sandbox_mode="workspace-write"',
+    ]
+    assert CountingCodexSession.instances[1].config_overrides == [
+        "-c",
+        'sandbox_mode="read-only"',
+    ]
 
 
 @pytest.mark.asyncio
