@@ -25,6 +25,7 @@ _SKIP_DIRS = {
     ".hermes",
     ".mypy_cache",
     ".nox",
+    ".nvm",
     ".pytest_cache",
     ".ruff_cache",
     ".tox",
@@ -99,6 +100,9 @@ def discover_git_workspaces(
                 if item not in _SKIP_DIRS and not item.startswith(".pytest")
             ]
             if (current_path / ".git").exists():
+                if current_path.name.startswith("."):
+                    dirs[:] = []
+                    continue
                 resolved = str(current_path.resolve())
                 if resolved not in seen:
                     seen.add(resolved)

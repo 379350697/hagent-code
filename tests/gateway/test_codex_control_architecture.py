@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+HERMES_ROOT = Path(os.environ["HERMES_AGENT"]).resolve() if os.environ.get("HERMES_AGENT") else ROOT
 
 
-def _imports(path: str) -> set[str]:
-    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+def _imports(path: str, *, root: Path = ROOT) -> set[str]:
+    target = root / path
+    if not target.exists():
+        pytest.skip(f"{path} is only available in a full Hermes checkout")
+    tree = ast.parse(target.read_text(encoding="utf-8"))
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -22,20 +29,20 @@ def _imports(path: str) -> set[str]:
 
 
 def test_discord_adapter_does_not_import_telegram_adapter() -> None:
-    imports = _imports("plugins/platforms/discord/adapter.py")
+    imports = _imports("plugins/platforms/discord/adapter.py", root=HERMES_ROOT)
 
     assert "gateway.platforms.telegram" not in imports
     assert "plugins.platforms.telegram.adapter" not in imports
 
 
 def test_telegram_adapter_does_not_import_discord_adapter() -> None:
-    imports = _imports("gateway/platforms/telegram.py")
+    imports = _imports("gateway/platforms/telegram.py", root=HERMES_ROOT)
 
     assert "plugins.platforms.discord.adapter" not in imports
 
 
 def test_slash_codex_entry_uses_platform_neutral_service() -> None:
-    imports = _imports("gateway/slash_commands.py")
+    imports = _imports("gateway/slash_commands.py", root=HERMES_ROOT)
 
     assert "gateway.control_planes.codex" in imports
     assert "tools.codex_app_server" not in imports

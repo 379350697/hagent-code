@@ -84,11 +84,12 @@ class CodexCommandService:
                 return CommandResult(f"Usage: /codex {subcommand} <task>", status="usage")
             if subcommand == "plan":
                 prompt = PLAN_PROMPT_PREFIX + prompt
+            new_session = subcommand in {"run", "new"} or self._sessions.peek(task_key) is None
             return await self._run(
                 task_key,
                 prompt,
                 workspace=self._workspace_for(request, task_key),
-                new_session=True,
+                new_session=new_session,
                 plan_mode=(subcommand == "plan"),
             )
         if subcommand in {"continue", "接着"}:
@@ -223,11 +224,12 @@ class CodexCommandService:
 
     def _sessions_status(self, request: CommandRequest) -> CommandResult:
         platform_prefix = f"{(request.platform or 'unknown').lower()}:"
-        records = [
+        raw_records = [
             record
             for record in self._registry.list(limit=50)
             if str(getattr(record, "task_key", "")).startswith(platform_prefix)
-        ][:10]
+        ]
+        records = self._dedupe_session_records(raw_records)[:10]
         if not records:
             return CommandResult("Codex: no sessions found for this platform.", status="not_found")
         lines = ["Codex sessions"]
@@ -344,7 +346,7 @@ class CodexCommandService:
                 status="busy",
             )
         try:
-            return self._run_locked(live, task_key, prompt, workspace, plan_mode)
+            return self._run_locked(live, task_key, prompt, workspace, new_session, plan_mode)
         finally:
             live.active_task_id = ""
             live.lock.release()
@@ -355,6 +357,7 @@ class CodexCommandService:
         task_key: str,
         prompt: str,
         workspace: str,
+        new_session: bool,
         plan_mode: bool,
     ) -> CommandResult:
         codex_cfg = load_codex_cfg()
@@ -371,24 +374,39 @@ class CodexCommandService:
                 diagnostics={"phase": "thread/start"},
             )
 
-        task_id = task_id_for(thread_id)
+        record = None if new_session else self._session_record(task_key, thread_id)
+        task_id = getattr(record, "task_id", "") or task_id_for(thread_id)
         live.active_task_id = task_id
-        self._registry.upsert(
-            make_task_record(
-                task_id=task_id,
-                task_key=task_key,
+        if record is None:
+            self._registry.upsert(
+                make_task_record(
+                    task_id=task_id,
+                    task_key=task_key,
+                    status="planning" if plan_mode else "running",
+                    workspace=workspace,
+                    thread_id=thread_id,
+                    turn_id="",
+                    model=model,
+                    approval=approval,
+                    sandbox=sandbox,
+                    plan_mode=plan_mode,
+                    prompt=prompt,
+                    last_message="Codex: turn started",
+                )
+            )
+        else:
+            self._registry.update(
+                task_id,
                 status="planning" if plan_mode else "running",
                 workspace=workspace,
                 thread_id=thread_id,
                 turn_id="",
                 model=model,
-                approval=approval,
+                approval_policy=approval,
                 sandbox=sandbox,
                 plan_mode=plan_mode,
-                prompt=prompt,
                 last_message="Codex: turn started",
             )
-        )
 
         turn = live.session.run_turn(user_input=prompt)
         status = "completed"
@@ -424,6 +442,52 @@ class CodexCommandService:
             thread_id=thread_id,
             diagnostics={"turn_id": getattr(turn, "turn_id", None) or ""},
         )
+
+    def _session_record(self, task_key: str, thread_id: str) -> Any:
+        try:
+            records = self._registry.list(task_key=task_key, limit=50)
+        except TypeError:
+            records = self._registry.list(limit=50)
+        except Exception:
+            records = []
+        matches = [
+            record
+            for record in records
+            if getattr(record, "task_key", "") == task_key
+            and getattr(record, "thread_id", "") == thread_id
+        ]
+        if matches:
+            return sorted(matches, key=lambda record: getattr(record, "started_at", 0) or 0)[0]
+        return self._registry.get(task_key=task_key)
+
+    @staticmethod
+    def _dedupe_session_records(records: list[Any]) -> list[Any]:
+        grouped: dict[tuple[str, str], list[Any]] = {}
+        for record in records:
+            key = (
+                str(getattr(record, "task_key", "") or ""),
+                str(getattr(record, "thread_id", "") or getattr(record, "task_id", "") or ""),
+            )
+            grouped.setdefault(key, []).append(record)
+
+        result: list[Any] = []
+        for group in grouped.values():
+            group.sort(key=lambda record: getattr(record, "started_at", 0) or 0)
+            canonical = group[0]
+            latest = max(group, key=lambda record: getattr(record, "updated_at", 0) or 0)
+            for attr in (
+                "status",
+                "turn_id",
+                "completed_at",
+                "last_message",
+                "token_usage",
+                "updated_at",
+            ):
+                if hasattr(canonical, attr):
+                    setattr(canonical, attr, getattr(latest, attr, getattr(canonical, attr)))
+            result.append(canonical)
+        result.sort(key=lambda record: getattr(record, "updated_at", 0) or 0, reverse=True)
+        return result
 
 _DEFAULT_SERVICE: CodexCommandService | None = None
 _DEFAULT_SERVICE_LOCK = threading.Lock()

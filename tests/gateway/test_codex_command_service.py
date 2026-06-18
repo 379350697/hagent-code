@@ -17,12 +17,14 @@ class FakeCodexSession:
         self.interrupted = False
         self.closed = False
         self.turns = 0
+        self.inputs = []
 
     def ensure_started(self):
         return self.thread_id
 
     def run_turn(self, user_input):
         self.turns += 1
+        self.inputs.append(user_input)
         return SimpleNamespace(
             final_text=f"ok: {user_input}",
             error=None,
@@ -167,6 +169,53 @@ async def test_continue_requires_live_session(tmp_path, monkeypatch) -> None:
 
     assert result.status == "not_found"
     assert "/codex new" in result.text
+
+
+@pytest.mark.asyncio
+async def test_continue_updates_existing_session_record(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch)
+
+    first = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new 123", workspace="/repo")
+    )
+    second = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="continue 456", workspace="/repo")
+    )
+    status = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="status", workspace="/repo")
+    )
+    sessions = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="sessions", workspace="/repo")
+    )
+
+    assert first.thread_id == second.thread_id
+    assert first.task_id == second.task_id
+    assert len(service._registry.records) == 1
+    assert "Task: 123" in status.text
+    assert "Task: 456" not in status.text
+    assert "Turn: turn-2" in status.text
+    assert sessions.text.count(first.thread_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_plan_continues_live_session_when_present(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch)
+
+    first = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new implement x", workspace="/repo")
+    )
+    planned = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="plan add tests", workspace="/repo")
+    )
+
+    live = service._sessions.peek("discord:42:main")
+    assert live is not None
+    assert first.thread_id == planned.thread_id
+    assert first.task_id == planned.task_id
+    assert len(service._registry.records) == 1
+    assert live.session.inputs[0] == "implement x"
+    assert "add tests" in live.session.inputs[1]
+    assert live.session.inputs[1].startswith("Create a detailed implementation plan first.")
 
 
 @pytest.mark.asyncio

@@ -71,6 +71,12 @@ Recommended Discord adapter behavior:
 - Register Discord `/codex` as native subcommands and dispatch them as text
   commands such as `/codex new <task>`, `/codex plan <task>`, and
   `/codex continue <task>`.
+- For workspace selection, prefer a nested native command group:
+  `/codex workspace list`, `/codex workspace current`,
+  `/codex workspace set <repo>`, and `/codex workspace clear`. The `repo`
+  parameter should use Discord autocomplete backed by
+  `discover_git_workspaces(workspace_scan_roots(...))`; send the selected
+  repository as `/codex workspace set <number-or-path>`.
 
 Telegram should dispatch the same text commands through the existing Hermes
 slash-command path. It should not import Discord adapter code.
@@ -96,6 +102,21 @@ export HERMES_CODEX_WORKSPACE_ROOTS="/home/wl/projects:/home/wl/.hermes"
 
 If neither variable is set, discovery scans the Hermes workspace, `HERMES_HOME`,
 and the user home with common heavy directories skipped.
+
+Hidden git repositories such as `.hermes` and `.nvm` are skipped in discovery
+so user-facing workspace choices look like project repositories. They can still
+be selected manually by absolute path when needed.
+
+## Session Semantics
+
+`/codex new <task>` and `/codex plan <task>` start a new Codex app-server
+session only when the current platform/chat/thread has no live session.
+When a live session already exists, `/codex plan <task>` continues that session
+with the plan prompt prefix instead of creating a second session.
+
+`/codex continue <task>` always targets the current live session. It updates the
+existing session record instead of creating a new one, and `/codex sessions`
+deduplicates older records by platform/chat/thread and Codex `thread_id`.
 
 ## Runtime Config
 
