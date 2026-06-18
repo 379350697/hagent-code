@@ -27,6 +27,17 @@ cp -R gateway/control_planes/codex "$HERMES_AGENT/gateway/control_planes/"
 cp gateway/control_planes/__init__.py "$HERMES_AGENT/gateway/control_planes/__init__.py"
 ```
 
+Remove the retired WebSocket tool wrapper if it exists in that checkout:
+
+```bash
+rm -f "$HERMES_AGENT/tools/codex_app_server.py"
+rm -f "$HERMES_AGENT/tests/tools/test_codex_app_server.py"
+```
+
+Do not remove `agent/transports/codex_app_server.py` or
+`agent/transports/codex_app_server_session.py`; those are the stdio runtime
+used by the control plane.
+
 ## Minimal Hermes Integration
 
 Hermes should keep platform code in its original locations. The only required
@@ -96,3 +107,6 @@ venv/bin/python -m pytest \
 
 For a full Hermes integration, also run the platform tests that cover Discord
 slash authorization and startup/reconnect isolation.
+
+Restart the Hermes gateway after deployment. A still-running old process can
+keep serving the retired `/codex` tool path until it is restarted.

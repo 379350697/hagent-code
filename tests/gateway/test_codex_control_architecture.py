@@ -39,3 +39,10 @@ def test_slash_codex_entry_uses_platform_neutral_service() -> None:
 
     assert "gateway.control_planes.codex" in imports
     assert "tools.codex_app_server" not in imports
+
+
+def test_codex_control_plane_does_not_import_legacy_tool() -> None:
+    for path in (ROOT / "gateway/control_planes/codex").glob("*.py"):
+        imports = _imports(str(path.relative_to(ROOT)))
+
+        assert "tools.codex_app_server" not in imports

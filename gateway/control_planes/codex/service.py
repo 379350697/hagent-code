@@ -17,7 +17,9 @@ from .formatting import (
     format_task_status,
 )
 from .execution import run_blocking
+from .git_digest import format_git_digest, git_digest
 from .models import CommandRequest, CommandResult
+from .registry import CodexTaskRegistry
 from .records import make_task_record
 from .runtime_config import (
     PLAN_PROMPT_PREFIX,
@@ -40,8 +42,6 @@ class CodexCommandService:
         session_factory: Optional[Callable[..., CodexAppServerSession]] = None,
     ) -> None:
         if registry is None:
-            from tools.codex_app_server import CodexTaskRegistry
-
             registry = CodexTaskRegistry()
         self._registry = registry
         self._sessions = CodexSessionPool(session_factory=session_factory)
@@ -133,11 +133,9 @@ class CodexCommandService:
         record = self._registry.get(task_key=task_key)
         resolved_workspace = workspace or (getattr(record, "workspace", "") if record else "")
         try:
-            from tools.codex_app_server import _format_git_digest, _git_digest
-
-            digest = _git_digest(resolved_workspace or os.getcwd())
+            digest = git_digest(resolved_workspace or os.getcwd())
             return CommandResult(
-                _format_git_digest(digest),
+                format_git_digest(digest),
                 status="ok" if digest.get("available") else "failed",
                 diagnostics={"git": digest},
             )

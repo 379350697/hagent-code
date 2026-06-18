@@ -18,7 +18,7 @@ def make_task_record(
     prompt: str,
     last_message: str,
 ):
-    from tools.codex_app_server import CodexTaskRecord
+    from .registry import CodexTaskRecord
 
     return CodexTaskRecord(
         task_id=task_id,
