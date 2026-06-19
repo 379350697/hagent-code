@@ -21,7 +21,8 @@ def format_failure(prefix: str, error: Any) -> str:
 
 def format_task_status(record: Any) -> str:
     lines = [
-        f"Codex task {getattr(record, 'task_id', '')}: {getattr(record, 'status', '')}",
+        f"Codex session {getattr(record, 'task_id', '')}",
+        f"Last turn: {getattr(record, 'status', '')}",
         f"Thread: {getattr(record, 'thread_id', '') or 'unknown'}",
     ]
     turn_id = getattr(record, "turn_id", "")

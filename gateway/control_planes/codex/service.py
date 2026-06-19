@@ -29,6 +29,7 @@ from .runtime_config import (
     normalize_sandbox_mode,
     read_codex_config_model,
 )
+from .selection import SelectedSessionStore
 from .session_pool import CodexSessionPool, LiveSession
 from .task_keys import build_codex_task_key, task_id_for
 from .workspaces import (
@@ -48,12 +49,14 @@ class CodexCommandService:
         *,
         registry: Any = None,
         workspace_store: Any = None,
+        selected_store: Any = None,
         session_factory: Optional[Callable[..., CodexAppServerSession]] = None,
     ) -> None:
         if registry is None:
             registry = CodexTaskRegistry()
         self._registry = registry
         self._workspace_store = workspace_store or WorkspaceSelectionStore()
+        self._selected_store = selected_store or SelectedSessionStore()
         self._sessions = CodexSessionPool(session_factory=session_factory)
 
     async def handle(self, request: CommandRequest) -> CommandResult:
@@ -66,7 +69,11 @@ class CodexCommandService:
         if subcommand in {"status"}:
             return self._status(task_key)
         if subcommand in {"sessions", "tasks", "ls", "list"}:
-            return self._sessions_status(request)
+            return self._sessions_status(request, task_key, rest)
+        if subcommand in {"select", "use"}:
+            return self._select_session(request, task_key, rest)
+        if subcommand in {"resume", "接续"}:
+            return await self._resume_session(request, task_key, rest)
         if subcommand in {"workspace", "workspaces", "cwd", "repo"}:
             return self._workspace_command(request, task_key, rest)
         if subcommand in {"diff", "git"}:
@@ -87,30 +94,64 @@ class CodexCommandService:
                 return CommandResult(f"Usage: /codex {subcommand} <task>", status="usage")
             if subcommand == "plan":
                 prompt = PLAN_PROMPT_PREFIX + prompt
-            new_session = subcommand in {"run", "new"} or self._sessions.peek(task_key) is None
+            new_session = subcommand in {"run", "new"}
+            resume_record = None
+            if not new_session and self._sessions.peek(task_key) is None:
+                resume_record = self._selected_or_latest_record(task_key)
+                new_session = resume_record is None
+            workspace = (
+                str(getattr(resume_record, "workspace", "") or "")
+                if resume_record is not None
+                else self._workspace_for(request, task_key)
+            )
             return await self._run(
                 request,
                 task_key,
                 prompt,
-                workspace=self._workspace_for(request, task_key),
+                workspace=workspace,
                 new_session=new_session,
                 plan_mode=(subcommand == "plan"),
+                resume_thread_id=(
+                    str(getattr(resume_record, "thread_id", "") or "")
+                    if resume_record is not None
+                    else ""
+                ),
+                select_session=True,
             )
         if subcommand in {"continue", "接着"}:
             prompt = rest.strip()
             if not prompt:
                 return CommandResult("Usage: /codex continue <task>", status="usage")
+            resume_record = self._selected_or_latest_record(task_key)
+            live = self._sessions.peek(task_key)
+            if resume_record is None and live is None:
+                return CommandResult(
+                    "No selected Codex session found for this chat. "
+                    "Use `/codex new <task>` or `/codex resume <session> <task>`.",
+                    status="not_found",
+                )
             return await self._run(
                 request,
                 task_key,
                 prompt,
-                workspace=self._workspace_for(request, task_key),
+                workspace=(
+                    str(getattr(resume_record, "workspace", "") or "")
+                    if resume_record is not None
+                    else self._workspace_for(request, task_key)
+                ),
                 new_session=False,
                 plan_mode=False,
+                resume_thread_id=(
+                    str(getattr(resume_record, "thread_id", "") or "")
+                    if resume_record is not None
+                    else ""
+                ),
+                select_session=True,
             )
 
         return CommandResult(
-            "Usage: /codex new <task> | continue <task> | status | sessions | "
+            "Usage: /codex new <task> | continue <task> | resume <session> <task> | "
+            "select <session> | status | sessions | "
             "workspace [list|set <path-or-number>|current|clear] | diff | stop | "
             "plan <task> | permissions <auto|workspace|readonly|danger>",
             status="usage",
@@ -217,7 +258,7 @@ class CodexCommandService:
         return CommandResult(f"Codex workspace selected:\n{selected}", status="ok")
 
     def _status(self, task_key: str) -> CommandResult:
-        record = self._registry.get(task_key=task_key)
+        record = self._selected_or_latest_record(task_key)
         if record is None:
             return CommandResult("Codex: no task found.", status="not_found")
         return CommandResult(
@@ -227,27 +268,215 @@ class CodexCommandService:
             thread_id=str(getattr(record, "thread_id", "") or ""),
         )
 
-    def _sessions_status(self, request: CommandRequest) -> CommandResult:
-        platform_prefix = f"{(request.platform or 'unknown').lower()}:"
-        raw_records = [
-            record
-            for record in self._registry.list(limit=50)
-            if str(getattr(record, "task_key", "")).startswith(platform_prefix)
-        ]
-        records = self._dedupe_session_records(raw_records)[:10]
+    def _sessions_status(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        raw_args: str = "",
+    ) -> CommandResult:
+        args = raw_args.strip()
+        include_all = args == "all"
+        workspace_query = ""
+        if args.startswith("workspace "):
+            workspace_query = args.split(maxsplit=1)[1].strip().lower()
+        records = self._session_records_for_request(
+            request,
+            task_key,
+            include_all=include_all,
+            workspace_query=workspace_query,
+            limit=50,
+        )
         if not records:
-            return CommandResult("Codex: no sessions found for this platform.", status="not_found")
+            return CommandResult("Codex: no sessions found for this scope.", status="not_found")
+        selected = self._selected_or_latest_record(task_key)
+        selected_thread = str(getattr(selected, "thread_id", "") or "")
         lines = ["Codex sessions"]
-        for record in records:
+        for index, record in enumerate(records[:10], start=1):
+            marker = "*" if getattr(record, "thread_id", "") == selected_thread else " "
             title = getattr(record, "title", "") or "(untitled)"
+            workspace = self._workspace_label(str(getattr(record, "workspace", "") or ""))
+            thread_id = str(getattr(record, "thread_id", "") or "")
             lines.append(
-                f"- {getattr(record, 'task_id', '')}: {getattr(record, 'status', '')} "
-                f"{getattr(record, 'thread_id', '')} {title}"
+                f"{index}. {marker} {getattr(record, 'task_id', '')} · "
+                f"{thread_id[:8]} · {workspace} · "
+                f"{getattr(record, 'status', '')} · {title}"
             )
-        return CommandResult("\n".join(lines), status="ok")
+        lines.append("Use `/codex select <number-or-id>` or `/codex resume <number-or-id> <task>`.")
+        return CommandResult(
+            "\n".join(lines),
+            status="ok",
+            diagnostics={
+                "sessions": [
+                    {
+                        "task_id": str(getattr(record, "task_id", "") or ""),
+                        "thread_id": str(getattr(record, "thread_id", "") or ""),
+                        "workspace": str(getattr(record, "workspace", "") or ""),
+                    }
+                    for record in records[:10]
+                ],
+            },
+        )
+
+    def _select_session(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        raw_selector: str,
+    ) -> CommandResult:
+        selector = raw_selector.strip()
+        if not selector:
+            return CommandResult("Usage: /codex select <session>", status="usage")
+        record, error = self._resolve_session_selector(request, task_key, selector)
+        if error is not None:
+            return error
+        assert record is not None
+        self._selected_store.set(
+            task_key,
+            task_id=str(getattr(record, "task_id", "") or ""),
+            thread_id=str(getattr(record, "thread_id", "") or ""),
+            workspace=str(getattr(record, "workspace", "") or ""),
+        )
+        return CommandResult(
+            "Codex session selected\n"
+            f"Task: {getattr(record, 'task_id', '')}\n"
+            f"Thread: {getattr(record, 'thread_id', '')}\n"
+            f"Workspace: {getattr(record, 'workspace', '')}",
+            status="ok",
+            task_id=str(getattr(record, "task_id", "") or ""),
+            thread_id=str(getattr(record, "thread_id", "") or ""),
+        )
+
+    async def _resume_session(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        raw_args: str,
+    ) -> CommandResult:
+        parts = raw_args.strip().split(maxsplit=1)
+        if len(parts) < 2:
+            return CommandResult("Usage: /codex resume <session> <task>", status="usage")
+        selector, prompt = parts[0], parts[1].strip()
+        if not prompt:
+            return CommandResult("Usage: /codex resume <session> <task>", status="usage")
+        record, error = self._resolve_session_selector(request, task_key, selector)
+        if error is not None:
+            return error
+        assert record is not None
+        return await self._run(
+            request,
+            task_key,
+            prompt,
+            workspace=str(getattr(record, "workspace", "") or self._workspace_for(request, task_key)),
+            new_session=False,
+            plan_mode=False,
+            resume_thread_id=str(getattr(record, "thread_id", "") or ""),
+            select_session=True,
+        )
+
+    def _session_records_for_request(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        *,
+        include_all: bool = False,
+        workspace_query: str = "",
+        limit: int = 50,
+    ) -> list[Any]:
+        platform_prefix = f"{(request.platform or 'unknown').lower()}:"
+        try:
+            raw_records = self._registry.list(limit=limit)
+        except TypeError:
+            raw_records = self._registry.list()
+        except Exception:
+            raw_records = []
+        if include_all:
+            records = [
+                record
+                for record in raw_records
+                if str(getattr(record, "task_key", "")).startswith(platform_prefix)
+            ]
+        else:
+            records = [
+                record
+                for record in raw_records
+                if str(getattr(record, "task_key", "") or "") == task_key
+            ]
+        if workspace_query:
+            records = [
+                record
+                for record in records
+                if workspace_query
+                in (
+                    f"{getattr(record, 'workspace', '')} "
+                    f"{self._workspace_label(str(getattr(record, 'workspace', '') or ''))}"
+                ).lower()
+            ]
+        records = [
+            record
+            for record in self._dedupe_session_records(records)
+            if getattr(record, "thread_id", "")
+        ]
+        return records
+
+    def _resolve_session_selector(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        selector: str,
+    ) -> tuple[Any | None, CommandResult | None]:
+        selector = selector.strip()
+        records = self._session_records_for_request(request, task_key, limit=100)
+        if selector.isdigit():
+            index = int(selector)
+            if 1 <= index <= len(records):
+                return records[index - 1], None
+            return None, CommandResult(
+                f"Codex session not found: index {index}",
+                status="not_found",
+            )
+        lowered = selector.lower()
+        matches = [
+            record
+            for record in records
+            if str(getattr(record, "task_id", "") or "").lower().startswith(lowered)
+            or str(getattr(record, "thread_id", "") or "").lower().startswith(lowered)
+        ]
+        if not matches:
+            return None, CommandResult(
+                f"Codex session not found: {selector}",
+                status="not_found",
+            )
+        if len(matches) > 1:
+            lines = ["Codex session selector is ambiguous"]
+            for record in matches[:5]:
+                lines.append(
+                    f"- {getattr(record, 'task_id', '')} · "
+                    f"{str(getattr(record, 'thread_id', '') or '')[:8]} · "
+                    f"{self._workspace_label(str(getattr(record, 'workspace', '') or ''))} · "
+                    f"{getattr(record, 'title', '') or '(untitled)'}"
+                )
+            return None, CommandResult("\n".join(lines), status="ambiguous")
+        return matches[0], None
+
+    def _selected_or_latest_record(self, task_key: str) -> Any:
+        selected = self._selected_store.get(task_key)
+        if selected is not None:
+            record = None
+            if selected.task_id:
+                record = self._registry.get(task_id=selected.task_id)
+            if record is None and selected.thread_id:
+                record = self._session_record(task_key, selected.thread_id)
+            if record is not None and getattr(record, "task_key", "") == task_key:
+                return record
+        return self._registry.get(task_key=task_key)
+
+    @staticmethod
+    def _workspace_label(workspace: str) -> str:
+        workspace = workspace.rstrip(os.sep)
+        return os.path.basename(workspace) if workspace else "(unknown)"
 
     def _diff(self, task_key: str, workspace: str) -> CommandResult:
-        record = self._registry.get(task_key=task_key)
+        record = self._selected_or_latest_record(task_key)
         resolved_workspace = workspace or (getattr(record, "workspace", "") if record else "")
         try:
             digest = git_digest(resolved_workspace or os.getcwd())
@@ -320,6 +549,8 @@ class CodexCommandService:
         workspace: str,
         new_session: bool,
         plan_mode: bool,
+        resume_thread_id: str = "",
+        select_session: bool = False,
     ) -> CommandResult:
         return await run_blocking(
             self._run_sync,
@@ -329,6 +560,8 @@ class CodexCommandService:
             workspace or os.getcwd(),
             new_session,
             plan_mode,
+            resume_thread_id,
+            select_session,
         )
 
     def _run_sync(
@@ -339,6 +572,8 @@ class CodexCommandService:
         workspace: str,
         new_session: bool,
         plan_mode: bool,
+        resume_thread_id: str = "",
+        select_session: bool = False,
     ) -> CommandResult:
         codex_cfg = load_codex_cfg()
         config_overrides = codex_app_server_config_overrides(codex_cfg)
@@ -347,6 +582,7 @@ class CodexCommandService:
             workspace,
             new_session=new_session,
             config_overrides=config_overrides,
+            resume_thread_id=resume_thread_id,
         )
         if live is None:
             return CommandResult(
@@ -383,6 +619,7 @@ class CodexCommandService:
                     new_session,
                     plan_mode,
                     codex_cfg,
+                    select_session,
                 )
         finally:
             if hasattr(live.session, "set_approval_callback"):
@@ -399,6 +636,7 @@ class CodexCommandService:
         new_session: bool,
         plan_mode: bool,
         codex_cfg: dict[str, Any] | None = None,
+        select_session: bool = False,
     ) -> CommandResult:
         codex_cfg = codex_cfg if isinstance(codex_cfg, dict) else load_codex_cfg()
         model = str(codex_cfg.get("model") or read_codex_config_model())
@@ -406,6 +644,7 @@ class CodexCommandService:
         approval = str(codex_cfg.get("approval_policy") or "on-request")
         try:
             thread_id = live.session.ensure_started()
+            live.thread_id = thread_id
         except Exception as exc:
             self._sessions.retire(task_key, live)
             return CommandResult(
@@ -446,6 +685,13 @@ class CodexCommandService:
                 sandbox=sandbox,
                 plan_mode=plan_mode,
                 last_message="Codex: turn started",
+            )
+        if select_session:
+            self._selected_store.set(
+                task_key,
+                task_id=task_id,
+                thread_id=thread_id,
+                workspace=workspace,
             )
 
         turn = live.session.run_turn(user_input=prompt)

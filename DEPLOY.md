@@ -94,6 +94,9 @@ Required Hermes transport integration:
 
 - `CodexAppServerSession` must accept `config_overrides: list[str]` and pass
   them to `CodexAppServerClient(extra_args=...)`.
+- It must accept `resume_thread_id: str`. When set, `ensure_started()` must
+  initialize the app-server and call `thread/resume` with the stored
+  `threadId` instead of `thread/start`.
 - It must expose `set_approval_callback(callback)` so each `/codex` turn can
   bind a fresh gateway approval context.
 - When Codex approval is unavailable, denied, or times out, surface that as a
@@ -127,14 +130,44 @@ be selected manually by absolute path when needed.
 
 ## Session Semantics
 
-`/codex new <task>` and `/codex plan <task>` start a new Codex app-server
-session only when the current platform/chat/thread has no live session.
-When a live session already exists, `/codex plan <task>` continues that session
-with the plan prompt prefix instead of creating a second session.
+`completed` means the last Codex turn completed; it does not mean the Codex
+thread/session is closed.
 
-`/codex continue <task>` always targets the current live session. It updates the
-existing session record instead of creating a new one, and `/codex sessions`
-deduplicates older records by platform/chat/thread and Codex `thread_id`.
+The control plane stores the current selected session per platform/chat/thread
+in:
+
+```text
+$HERMES_HOME/codex-control-plane/selected_sessions.json
+```
+
+`/codex new <task>` always starts a new Codex thread and selects it for the
+current chat. Workspace selection affects new sessions only.
+
+`/codex continue <task>` targets the selected session. If no selection exists,
+it falls back to the newest recoverable session in the current chat. If the
+Hermes gateway was restarted and no app-server process is live, the control
+plane recreates the app-server and resumes the stored Codex `threadId`.
+
+History commands:
+
+```text
+/codex sessions
+/codex sessions workspace <query>
+/codex sessions all
+/codex select <number-or-task-id-or-thread-id>
+/codex resume <number-or-task-id-or-thread-id> <task>
+```
+
+`/codex sessions` shows recent sessions for the current platform/chat/thread,
+including workspace and last-turn status. `select` changes the current chat's
+selected session without starting a turn. `resume` selects a historical session
+and immediately starts a new turn in that thread. Selectors may be the displayed
+number, a `task_id` prefix, or a Codex `thread_id` prefix; ambiguous prefixes
+return candidates and do not start Codex.
+
+Discord should expose `/codex select` and `/codex resume` as native subcommands
+with autocomplete backed by the control plane's session list. Telegram can use
+the same text commands.
 
 ## Runtime Config
 

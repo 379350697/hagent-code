@@ -10,11 +10,19 @@ from gateway.control_planes.codex import (
 
 
 class FakeCodexSession:
-    def __init__(self, *, cwd, approval_callback=None, config_overrides=None):
+    def __init__(
+        self,
+        *,
+        cwd,
+        approval_callback=None,
+        config_overrides=None,
+        resume_thread_id="",
+    ):
         self.cwd = cwd
         self.approval_callback = approval_callback
         self.config_overrides = list(config_overrides or [])
-        self.thread_id = f"thread-{cwd.rsplit('/', 1)[-1] or 'root'}"
+        self.resume_thread_id = resume_thread_id
+        self.thread_id = resume_thread_id or f"thread-{cwd.rsplit('/', 1)[-1] or 'root'}"
         self.interrupted = False
         self.closed = False
         self.turns = 0
@@ -135,14 +143,45 @@ class MemoryWorkspaceStore:
         self.values.pop(task_key, None)
 
 
-def _service(tmp_path, monkeypatch, session_factory=FakeCodexSession):
+class MemorySelectedStore:
+    def __init__(self):
+        self.values = {}
+
+    def get(self, task_key):
+        return self.values.get(task_key)
+
+    def set(self, task_key, *, task_id, thread_id, workspace=""):
+        from gateway.control_planes.codex.selection import SelectedSession
+
+        selected = SelectedSession(
+            task_id=task_id,
+            thread_id=thread_id,
+            workspace=workspace,
+            selected_at=1.0,
+        )
+        self.values[task_key] = selected
+        return selected
+
+    def clear(self, task_key):
+        self.values.pop(task_key, None)
+
+
+def _service(
+    tmp_path,
+    monkeypatch,
+    session_factory=FakeCodexSession,
+    *,
+    registry=None,
+    selected_store=None,
+):
     from gateway.control_planes.codex import service as service_mod
 
     monkeypatch.setattr(service_mod, "load_codex_cfg", lambda: {})
     monkeypatch.setattr(service_mod, "read_codex_config_model", lambda: "gpt-5.5")
     return CodexCommandService(
-        registry=MemoryRegistry(),
+        registry=registry or MemoryRegistry(),
         workspace_store=MemoryWorkspaceStore(),
+        selected_store=selected_store or MemorySelectedStore(),
         session_factory=session_factory,
     )
 
@@ -231,7 +270,165 @@ async def test_continue_updates_existing_session_record(tmp_path, monkeypatch) -
     assert "Task: 123" in status.text
     assert "Task: 456" not in status.text
     assert "Turn: turn-2" in status.text
-    assert sessions.text.count(first.thread_id) == 1
+    assert sessions.text.count(first.thread_id[:8]) == 1
+
+
+@pytest.mark.asyncio
+async def test_continue_restores_selected_session_after_service_restart(
+    tmp_path, monkeypatch,
+) -> None:
+    CountingCodexSession.instances = []
+    registry = MemoryRegistry()
+    selected = MemorySelectedStore()
+    first_service = _service(
+        tmp_path,
+        monkeypatch,
+        session_factory=CountingCodexSession,
+        registry=registry,
+        selected_store=selected,
+    )
+    first = await first_service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="new yesterday",
+            workspace="/repo-a",
+        )
+    )
+
+    second_service = _service(
+        tmp_path,
+        monkeypatch,
+        session_factory=CountingCodexSession,
+        registry=registry,
+        selected_store=selected,
+    )
+    second = await second_service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="continue today",
+            workspace="/repo-b",
+        )
+    )
+
+    assert second.status == "completed"
+    assert second.thread_id == first.thread_id
+    assert len(CountingCodexSession.instances) == 2
+    assert CountingCodexSession.instances[1].resume_thread_id == first.thread_id
+    assert CountingCodexSession.instances[1].cwd == "/repo-a"
+
+
+@pytest.mark.asyncio
+async def test_resume_selector_continues_old_workspace_after_workspace_switch(
+    tmp_path, monkeypatch,
+) -> None:
+    CountingCodexSession.instances = []
+    service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
+    repo_a = _make_git_repo(tmp_path / "repo-a")
+    repo_b = _make_git_repo(tmp_path / "repo-b")
+
+    first = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace=str(repo_a))
+    )
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text=f"workspace set {repo_b}")
+    )
+    second = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new second", workspace=str(repo_a))
+    )
+    resumed = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text=f"resume {first.task_id} back to first",
+            workspace=str(repo_b),
+        )
+    )
+
+    assert first.thread_id != second.thread_id
+    assert resumed.thread_id == first.thread_id
+    assert f"Workspace: {repo_a}" in resumed.text
+    assert CountingCodexSession.instances[-1].resume_thread_id == first.thread_id
+    assert CountingCodexSession.instances[-1].cwd == str(repo_a)
+
+
+@pytest.mark.asyncio
+async def test_select_changes_current_session_without_running_turn(tmp_path, monkeypatch) -> None:
+    CountingCodexSession.instances = []
+    service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
+    repo_a = _make_git_repo(tmp_path / "repo-a")
+    repo_b = _make_git_repo(tmp_path / "repo-b")
+
+    first = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace=str(repo_a))
+    )
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text=f"workspace set {repo_b}")
+    )
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new second", workspace=str(repo_a))
+    )
+    turns_before = sum(instance.turns for instance in CountingCodexSession.instances)
+
+    selected = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text=f"select {first.task_id}")
+    )
+    continued = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="continue after select")
+    )
+
+    assert selected.status == "ok"
+    assert sum(instance.turns for instance in CountingCodexSession.instances) == turns_before + 1
+    assert continued.thread_id == first.thread_id
+
+
+@pytest.mark.asyncio
+async def test_selector_ambiguity_returns_candidates_without_running(tmp_path, monkeypatch) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+
+    registry = MemoryRegistry()
+    registry.upsert(
+        make_task_record(
+            task_id="abc111",
+            task_key="discord:42:main",
+            status="completed",
+            workspace="/repo-a",
+            thread_id="thread-one",
+            turn_id="turn-1",
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="one",
+            last_message="done",
+        )
+    )
+    registry.upsert(
+        make_task_record(
+            task_id="abc222",
+            task_key="discord:42:main",
+            status="completed",
+            workspace="/repo-b",
+            thread_id="thread-two",
+            turn_id="turn-2",
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="two",
+            last_message="done",
+        )
+    )
+    service = _service(tmp_path, monkeypatch, registry=registry)
+
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="select abc")
+    )
+
+    assert result.status == "ambiguous"
+    assert "abc111" in result.text
+    assert "abc222" in result.text
 
 
 @pytest.mark.asyncio
@@ -351,7 +548,7 @@ async def test_codex_danger_mode_auto_approves_without_notify(
 
 
 @pytest.mark.asyncio
-async def test_workspace_change_recreates_live_session(tmp_path, monkeypatch) -> None:
+async def test_workspace_change_drives_next_new_session(tmp_path, monkeypatch) -> None:
     CountingCodexSession.instances = []
     service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
     repo_a = _make_git_repo(tmp_path / "repo-a")
@@ -364,7 +561,7 @@ async def test_workspace_change_recreates_live_session(tmp_path, monkeypatch) ->
         CommandRequest(platform="discord", chat_id="42", text=f"workspace set {repo_b}")
     )
     second = await service.handle(
-        CommandRequest(platform="discord", chat_id="42", text="plan second", workspace=str(repo_a))
+        CommandRequest(platform="discord", chat_id="42", text="new second", workspace=str(repo_a))
     )
 
     assert first.status == "completed"

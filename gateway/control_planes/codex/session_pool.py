@@ -18,6 +18,7 @@ class LiveSession:
     workspace: str
     config_overrides: list[str]
     lock: threading.Lock
+    thread_id: str = ""
     active_task_id: str = ""
 
 
@@ -40,8 +41,10 @@ class CodexSessionPool:
         *,
         new_session: bool,
         config_overrides: list[str] | None = None,
+        resume_thread_id: str = "",
     ) -> LiveSession | None:
         desired_config = list(config_overrides or [])
+        desired_thread_id = str(resume_thread_id or "")
         with self._lock:
             existing = self._sessions.get(task_key)
             retired_existing = False
@@ -51,6 +54,12 @@ class CodexSessionPool:
                     new_session
                     or existing.workspace != workspace
                     or existing.config_overrides != desired_config
+                    or (
+                        desired_thread_id
+                        and existing.thread_id
+                        and existing.thread_id != desired_thread_id
+                    )
+                    or (desired_thread_id and not existing.thread_id)
                 )
             ):
                 self.retire(task_key, existing)
@@ -58,17 +67,19 @@ class CodexSessionPool:
                 retired_existing = True
             if existing is not None:
                 return existing
-            if not new_session and not retired_existing:
+            if not new_session and not retired_existing and not desired_thread_id:
                 return None
             session = self._session_factory(
                 cwd=workspace,
                 config_overrides=desired_config,
+                resume_thread_id=desired_thread_id,
             )
             live = LiveSession(
                 session=session,
                 workspace=workspace,
                 config_overrides=desired_config,
                 lock=threading.Lock(),
+                thread_id=desired_thread_id,
             )
             self._sessions[task_key] = live
             return live
