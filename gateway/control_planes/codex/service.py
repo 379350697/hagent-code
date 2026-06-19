@@ -348,7 +348,11 @@ class CodexCommandService:
         raw_args: str = "",
     ) -> CommandResult:
         args = raw_args.strip()
+        verbose = args in {"verbose", "details", "ids"}
         include_all = args == "all"
+        if args in {"all verbose", "all details", "all ids"}:
+            include_all = True
+            verbose = True
         workspace_query = ""
         if include_all and not self._can_show_all_sessions(request):
             return CommandResult(
@@ -374,13 +378,15 @@ class CodexCommandService:
             title = self._session_title(record)
             workspace = self._workspace_label(str(getattr(record, "workspace", "") or ""))
             thread_id = str(getattr(record, "thread_id", "") or "")
+            prefix = f"{index}. {marker} "
+            if verbose or include_all:
+                prefix += f"{getattr(record, 'task_id', '')} · {thread_id[:8]} · "
             lines.append(
-                f"{index}. {marker} {getattr(record, 'task_id', '')} · "
-                f"{thread_id[:8]} · {workspace} · "
-                f"{self._session_state_label(record)} · "
+                f"{prefix}{workspace} · {self._session_state_label(record)} · "
                 f"最近一轮：{self._status_label(getattr(record, 'status', ''))} · {title}"
             )
-        lines.append("使用 `/codex select <序号或ID>` 选择，或 `/codex resume <序号或ID> <任务>` 接续。")
+        lines.append("使用 `/codex select <序号>` 选择，或 `/codex resume <序号> <任务>` 接续。")
+        lines.append("需要内部 ID 时用 `/codex sessions verbose`。")
         return CommandResult(
             "\n".join(lines),
             status="ok",

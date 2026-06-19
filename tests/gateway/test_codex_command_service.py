@@ -344,6 +344,9 @@ async def test_continue_updates_existing_session_record(tmp_path, monkeypatch) -
     sessions = await service.handle(
         CommandRequest(platform="discord", chat_id="42", text="sessions", workspace="/repo")
     )
+    verbose_sessions = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="sessions verbose", workspace="/repo")
+    )
 
     assert first.thread_id == second.thread_id
     assert first.task_id == second.task_id
@@ -351,7 +354,8 @@ async def test_continue_updates_existing_session_record(tmp_path, monkeypatch) -
     assert "任务：123" in status.text
     assert "任务：456" not in status.text
     assert "轮次：turn-2" in status.text
-    assert sessions.text.count(first.thread_id[:8]) == 1
+    assert first.thread_id[:8] not in sessions.text
+    assert verbose_sessions.text.count(first.thread_id[:8]) == 1
 
 
 @pytest.mark.asyncio
@@ -709,7 +713,41 @@ async def test_sessions_separate_resumable_session_from_last_turn_status(
     assert "可接续" in sessions.text
     assert "最近一轮：失败" in sessions.text
     assert "计划会话" in sessions.text
+    assert "failed123" not in sessions.text
+    assert "thread-failed" not in sessions.text
     assert "Create a detailed implementation plan first" not in sessions.text
+
+
+@pytest.mark.asyncio
+async def test_sessions_verbose_can_show_internal_ids(tmp_path, monkeypatch) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+
+    registry = MemoryRegistry()
+    registry.upsert(
+        make_task_record(
+            task_id="abc123",
+            task_key="discord:42:main",
+            status="completed",
+            workspace="/repo",
+            thread_id="thread-visible",
+            turn_id="turn-1",
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="original",
+            last_message="done",
+        )
+    )
+    service = _service(tmp_path, monkeypatch, registry=registry)
+
+    sessions = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="sessions verbose", workspace="/repo")
+    )
+
+    assert sessions.status == "ok"
+    assert "abc123" in sessions.text
+    assert "thread-v" in sessions.text
 
 
 @pytest.mark.asyncio
