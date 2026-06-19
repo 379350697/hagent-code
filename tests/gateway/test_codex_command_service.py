@@ -890,8 +890,34 @@ async def test_codex_repair_recovered_preview_and_apply(
             "last_agent_message": "真实已经完成",
         },
     }
+    other_native_record = {
+        "timestamp": "2999-01-01T00:00:01Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "turn_id": "turn-other",
+            "last_agent_message": "其他聊天完成",
+        },
+    }
+    mismatched_native_record = {
+        "timestamp": "2999-01-01T00:00:02Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "turn_id": "turn-different",
+            "last_agent_message": "不该修复旧轮次",
+        },
+    }
     (session_dir / "rollout-2999-thread-repair.jsonl").write_text(
         json.dumps(native_record) + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "rollout-2999-thread-other.jsonl").write_text(
+        json.dumps(other_native_record) + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "rollout-2999-thread-mismatch.jsonl").write_text(
+        json.dumps(mismatched_native_record) + "\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -903,12 +929,44 @@ async def test_codex_repair_recovered_preview_and_apply(
             status="failed",
             workspace="/repo",
             thread_id="thread-repair",
-            turn_id="turn-old",
+            turn_id="turn-native",
             model="gpt-5.5",
             approval="on-request",
             sandbox="workspace-write",
             plan_mode=False,
             prompt="original",
+            last_message="Hermes observer timeout",
+        )
+    )
+    registry.upsert(
+        make_task_record(
+            task_id="other123",
+            task_key="discord:99:main",
+            status="failed",
+            workspace="/other",
+            thread_id="thread-other",
+            turn_id="turn-other",
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="other",
+            last_message="Hermes observer timeout",
+        )
+    )
+    registry.upsert(
+        make_task_record(
+            task_id="mismatch123",
+            task_key="discord:42:main",
+            status="failed",
+            workspace="/repo",
+            thread_id="thread-mismatch",
+            turn_id="turn-old",
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="mismatch",
             last_message="Hermes observer timeout",
         )
     )
@@ -929,9 +987,15 @@ async def test_codex_repair_recovered_preview_and_apply(
     assert preview.status == "preview"
     assert "找到 1 条" in preview.text
     assert "真实已经完成" in preview.text
+    assert "repair123" not in preview.text
+    assert "thread-repair" not in preview.text
+    assert "其他聊天完成" not in preview.text
+    assert "不该修复旧轮次" not in preview.text
     assert applied.status == "ok"
     assert registry.records["repair123"].status == "completed"
     assert registry.records["repair123"].turn_id == "turn-native"
+    assert registry.records["other123"].status == "failed"
+    assert registry.records["mismatch123"].status == "failed"
 
 
 @pytest.mark.asyncio

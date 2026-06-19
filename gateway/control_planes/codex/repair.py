@@ -24,10 +24,11 @@ def find_recoverable_completed_turns(
     registry: Any,
     *,
     codex_home: str = "",
+    task_key: str = "",
     limit: int = 50,
 ) -> list[RecoverableTurn]:
     try:
-        records = registry.list(limit=limit)
+        records = registry.list(task_key=task_key or None, limit=limit)
     except TypeError:
         records = registry.list()
     except Exception:
@@ -38,18 +39,23 @@ def find_recoverable_completed_turns(
         if status not in {"failed", "unconfirmed"}:
             continue
         thread_id = str(getattr(record, "thread_id", "") or "")
-        if not thread_id:
+        turn_id = str(getattr(record, "turn_id", "") or "")
+        if not thread_id or not turn_id:
             continue
-        complete = latest_native_task_complete(thread_id, codex_home=codex_home)
+        complete = latest_native_task_complete(
+            thread_id,
+            codex_home=codex_home,
+            expected_turn_id=turn_id,
+        )
         if complete is None:
             continue
-        turn_id, message = complete
+        native_turn_id, message = complete
         recoverable.append(
             RecoverableTurn(
                 task_id=str(getattr(record, "task_id", "") or ""),
                 task_key=str(getattr(record, "task_key", "") or ""),
                 thread_id=thread_id,
-                turn_id=turn_id or str(getattr(record, "turn_id", "") or ""),
+                turn_id=native_turn_id,
                 workspace=str(getattr(record, "workspace", "") or ""),
                 message_preview=" ".join(message.split())[:160],
             )
@@ -77,6 +83,7 @@ def latest_native_task_complete(
     thread_id: str,
     *,
     codex_home: str = "",
+    expected_turn_id: str = "",
 ) -> tuple[str, str] | None:
     if not thread_id:
         return None
@@ -97,13 +104,16 @@ def latest_native_task_complete(
                     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
                     if payload.get("type") != "task_complete":
                         continue
+                    turn_id = str(payload.get("turn_id") or "")
+                    if expected_turn_id and turn_id != expected_turn_id:
+                        continue
                     message = str(payload.get("last_agent_message") or "").strip()
                     if not message:
                         continue
                     timestamp = _parse_timestamp(record.get("timestamp"))
                     if timestamp >= best_time:
                         best_time = timestamp
-                        best = (str(payload.get("turn_id") or ""), message)
+                        best = (turn_id, message)
         except OSError:
             continue
     return best

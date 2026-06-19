@@ -59,27 +59,29 @@ def format_task_status(record: Any, *, verbose: bool = False) -> str:
 
 
 def format_run_success(workspace: str, thread_id: str, message: str) -> str:
+    del thread_id
     body = message.strip() or "Codex 已完成，但没有返回最终文本。"
     return (
         "Codex 结果\n"
         f"工作区：{workspace}\n"
-        f"会话：{thread_id}\n\n"
+        "会话：当前会话\n\n"
         f"{body}"
     )
 
 
 def format_run_failure(workspace: str, thread_id: str, error: str) -> str:
+    del thread_id
     if is_observer_unconfirmed_error(error):
         return (
             "Hermes 未确认本轮结果\n"
             f"工作区：{workspace}\n"
-            f"会话：{thread_id or '新会话'}\n"
+            "会话：当前会话\n"
             f"说明：{format_failure('Codex app-server failed', error)}"
         )
     return (
         "Codex 任务失败\n"
         f"工作区：{workspace}\n"
-        f"会话：{thread_id or '新会话'}\n"
+        "会话：当前会话\n"
         f"错误：{format_failure('Codex app-server failed', error)}"
     )
 

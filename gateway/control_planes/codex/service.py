@@ -81,7 +81,7 @@ class CodexCommandService:
         if subcommand in {"status"}:
             return self._status(request, task_key)
         if subcommand in {"doctor", "诊断"}:
-            return self._doctor(request, task_key)
+            return await self._doctor(request, task_key)
         if subcommand in {"repair", "recover", "修复"}:
             return self._repair(request, task_key, rest)
         if subcommand in {"events", "eventlog", "log"}:
@@ -306,18 +306,20 @@ class CodexCommandService:
             thread_id=str(getattr(record, "thread_id", "") or ""),
         )
 
-    def _doctor(self, request: CommandRequest, task_key: str) -> CommandResult:
+    async def _doctor(self, request: CommandRequest, task_key: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
         workspace = (
             str(getattr(record, "workspace", "") or "")
             if record is not None
             else self._workspace_for(request, task_key)
         )
-        checks = run_codex_doctor(
-            workspace=workspace,
-            task_key=task_key,
-            selected_record=record,
-            event_store=self._event_store,
+        checks = await run_blocking(
+            lambda: run_codex_doctor(
+                workspace=workspace,
+                task_key=task_key,
+                selected_record=record,
+                event_store=self._event_store,
+            )
         )
         status = "failed" if any(item.status == "fail" for item in checks) else "ok"
         return CommandResult(
@@ -340,33 +342,49 @@ class CodexCommandService:
         args = raw_args.strip()
         if args and not args.startswith("recovered"):
             return CommandResult(
-                "用法：/codex repair recovered [--apply]",
+                "用法：/codex repair recovered [all] [--apply]",
                 status="usage",
             )
-        apply = "--apply" in args.split()
-        if apply and not self._can_show_all_sessions(request):
+        parts = args.split()
+        apply = "--apply" in parts
+        include_all = "all" in parts
+        if (apply or include_all) and not self._can_show_all_sessions(request):
             return CommandResult(
-                "只有管理员诊断模式可以应用 Codex 历史修复。",
+                "只有管理员诊断模式可以应用或跨聊天扫描 Codex 历史修复。",
                 status="forbidden",
             )
-        recoverable = find_recoverable_completed_turns(self._registry)
+        recoverable = find_recoverable_completed_turns(
+            self._registry,
+            task_key="" if include_all else task_key,
+        )
         if not recoverable:
             return CommandResult("没有找到可自动修复的 Codex 历史记录。", status="ok")
         lines = [
             "Codex 历史修复",
             f"找到 {len(recoverable)} 条可从原生 task_complete 确认完成的记录。",
         ]
+        if not include_all:
+            lines.append("范围：当前平台 / 当前聊天 / 当前 thread。")
         for item in recoverable[:10]:
-            lines.append(
-                f"- {item.task_id} · {item.thread_id[:8]} · "
-                f"{self._workspace_label(item.workspace)} · {item.message_preview}"
-            )
+            if include_all:
+                lines.append(
+                    f"- {item.task_id} · {item.thread_id[:8]} · "
+                    f"{self._workspace_label(item.workspace)} · {item.message_preview}"
+                )
+            else:
+                lines.append(
+                    f"- {self._workspace_label(item.workspace)} · {item.message_preview}"
+                )
         if apply:
             count = apply_recovered_turns(self._registry, recoverable)
             lines.append(f"已修复 {count} 条记录为已完成。")
             status = "ok"
         else:
-            lines.append("这是预览；确认后用 `/codex repair recovered --apply` 应用。")
+            command = (
+                "/codex repair recovered all --apply"
+                if include_all else "/codex repair recovered --apply"
+            )
+            lines.append(f"这是预览；确认后用 `{command}` 应用。")
             status = "preview"
         return CommandResult("\n".join(lines), status=status)
 
