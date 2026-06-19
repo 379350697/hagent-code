@@ -73,6 +73,14 @@ class CodexFieldNarrator:
                 evidence=[f"最近活动超过 {timeout} 秒"] if timeout else [],
                 dedupe_key="turn_timed_out",
             )
+        if event_type == "turn.unconfirmed":
+            error = _one_line(_localize_runtime_error(str(payload.get("error") or "未知")), 160)
+            return CodexNarration(
+                "Hermes 没确认到这轮的最终事件；我不会替 Codex 判失败，会让下一轮从干净状态恢复。",
+                importance="critical",
+                evidence=[error] if error else [],
+                dedupe_key="turn_unconfirmed",
+            )
         if event_type == "turn.failed":
             error = _one_line(_localize_runtime_error(str(payload.get("error") or "未知错误")), 160)
             return CodexNarration(

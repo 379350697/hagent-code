@@ -63,6 +63,21 @@ class TimeoutCodexSession(FakeCodexSession):
         raise TimeoutError("thread/start timed out after 15s")
 
 
+class ObserverUnconfirmedCodexSession(FakeCodexSession):
+    def run_turn(self, user_input, **options):
+        self.turns += 1
+        self.inputs.append(user_input)
+        self.run_turn_options.append(dict(options))
+        return SimpleNamespace(
+            final_text="",
+            error="turn timed out after 600.0s without app-server activity",
+            interrupted=True,
+            should_retire=True,
+            turn_id=f"turn-{self.turns}",
+            token_usage_total={},
+        )
+
+
 class ApprovalCodexSession(FakeCodexSession):
     last_instance = None
 
@@ -800,6 +815,34 @@ async def test_codex_approval_bridge_unavailable_is_explicit(
 
 
 @pytest.mark.asyncio
+async def test_codex_observer_timeout_is_unconfirmed_not_failed(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(
+        tmp_path,
+        monkeypatch,
+        session_factory=ObserverUnconfirmedCodexSession,
+    )
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="new inspect",
+            workspace="/repo",
+        )
+    )
+
+    assert result.status == "unconfirmed"
+    assert "Hermes 未确认本轮结果" in result.text
+    assert "Codex 任务失败" not in result.text
+    status = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="status")
+    )
+    assert "最近一轮：未确认" in status.text
+
+
+@pytest.mark.asyncio
 async def test_codex_sandbox_config_is_passed_to_app_server(
     tmp_path, monkeypatch,
 ) -> None:
@@ -955,6 +998,30 @@ def test_codex_narrator_localizes_failed_turn_evidence() -> None:
     assert "没有新事件" in rendered
     assert "went silent" not in rendered
     assert "收口" not in rendered
+
+
+def test_codex_narrator_keeps_observer_timeout_unconfirmed() -> None:
+    event = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="turn.unconfirmed",
+        payload={
+            "error": "turn timed out after 600.0s without app-server activity",
+        },
+        occurred_at=0.0,
+    )
+
+    narration = CodexFieldNarrator().narrate(event, workspace="/repo", thread_id="thread")
+
+    assert narration is not None
+    rendered = narration.render()
+    assert "没确认到" in rendered
+    assert "判失败" in rendered
 
 
 @pytest.mark.asyncio

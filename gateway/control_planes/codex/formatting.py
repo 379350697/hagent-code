@@ -9,6 +9,8 @@ from typing import Any
 def format_failure(prefix: str, error: Any) -> str:
     message = _localize_message(str(error or "未知错误"))
     lowered = message.lower()
+    if is_observer_unconfirmed_error(message):
+        return f"Hermes 观测中断：{message}"
     if "codex approval bridge unavailable" in lowered or "codex 审批通道不可用" in message:
         return "Codex 审批通道不可用：当前聊天没有接上审批回调。"
     if (
@@ -65,6 +67,13 @@ def format_run_success(workspace: str, thread_id: str, message: str) -> str:
 
 
 def format_run_failure(workspace: str, thread_id: str, error: str) -> str:
+    if is_observer_unconfirmed_error(error):
+        return (
+            "Hermes 未确认本轮结果\n"
+            f"工作区：{workspace}\n"
+            f"会话：{thread_id or '新会话'}\n"
+            f"说明：{format_failure('Codex app-server failed', error)}"
+        )
     return (
         "Codex 任务失败\n"
         f"工作区：{workspace}\n"
@@ -112,6 +121,7 @@ def _status_label(status: str) -> str:
         "completed": "已完成",
         "failed": "失败",
         "interrupted": "已中断",
+        "unconfirmed": "未确认",
         "busy": "忙碌",
         "not_found": "未找到",
         "unknown": "未知",
@@ -141,3 +151,14 @@ def _display_title(title: Any) -> str:
     if value.startswith("Create a detailed implementation plan first."):
         return "计划会话"
     return value
+
+
+def is_observer_unconfirmed_error(error: Any) -> bool:
+    text = _localize_message(str(error or ""))
+    lowered = text.lower()
+    return (
+        "没有新事件" in text
+        or "没有收到 app-server 活动" in text
+        or "without app-server activity" in lowered
+        or "app-server 在工具步骤后" in text
+    )

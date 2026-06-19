@@ -17,6 +17,7 @@ from .formatting import (
     format_run_failure,
     format_run_success,
     format_task_status,
+    is_observer_unconfirmed_error,
 )
 from .execution import run_blocking
 from .git_digest import format_git_digest, git_digest
@@ -580,6 +581,7 @@ class CodexCommandService:
             "completed": "已完成",
             "failed": "失败",
             "interrupted": "已中断",
+            "unconfirmed": "未确认",
             "busy": "忙碌",
             "not_found": "未找到",
             "unknown": "未知",
@@ -885,7 +887,11 @@ class CodexCommandService:
         status = "completed"
         last_message = "Codex: turn completed"
         if getattr(turn, "error", None):
-            status = "failed"
+            status = (
+                "unconfirmed"
+                if is_observer_unconfirmed_error(str(turn.error))
+                else "failed"
+            )
             last_message = str(turn.error)
         elif getattr(turn, "interrupted", False):
             status = "interrupted"
@@ -906,7 +912,11 @@ class CodexCommandService:
             turn_id=getattr(turn, "turn_id", None) or "",
             platform=request.platform,
             chat_id=request.chat_id,
-            event_type="turn.failed" if getattr(turn, "error", None) else "turn.completed",
+            event_type=(
+                "turn.unconfirmed"
+                if status == "unconfirmed"
+                else "turn.failed" if getattr(turn, "error", None) else "turn.completed"
+            ),
             payload={
                 "status": status,
                 "error": str(getattr(turn, "error", "") or ""),
