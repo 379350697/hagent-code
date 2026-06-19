@@ -44,7 +44,7 @@ def format_task_status(record: Any) -> str:
     model = getattr(record, "model", "")
     if model:
         lines.append(f"模型：{model}")
-    title = getattr(record, "title", "")
+    title = _display_title(getattr(record, "title", ""))
     if title:
         lines.append(f"任务：{title}")
     last = getattr(record, "last_message", "")
@@ -126,3 +126,10 @@ def _approval_label(value: Any) -> str:
         "never": "无需审批",
         "untrusted": "严格审批",
     }.get(raw, raw)
+
+
+def _display_title(title: Any) -> str:
+    value = " ".join(str(title or "").split())
+    if value.startswith("Create a detailed implementation plan first."):
+        return "计划会话"
+    return value

@@ -676,6 +676,43 @@ async def test_plan_session_title_uses_user_task_not_internal_prompt(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_sessions_separate_resumable_session_from_last_turn_status(
+    tmp_path, monkeypatch,
+) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+
+    registry = MemoryRegistry()
+    registry.upsert(
+        make_task_record(
+            task_id="failed123",
+            task_key="discord:42:main",
+            status="failed",
+            workspace="/repo",
+            thread_id="thread-failed",
+            turn_id="turn-1",
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="original",
+            title="Create a detailed implementation plan first. Include the files to change",
+            last_message="turn timed out",
+        )
+    )
+    service = _service(tmp_path, monkeypatch, registry=registry)
+
+    sessions = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="sessions", workspace="/repo")
+    )
+
+    assert sessions.status == "ok"
+    assert "可接续" in sessions.text
+    assert "最近一轮：失败" in sessions.text
+    assert "计划会话" in sessions.text
+    assert "Create a detailed implementation plan first" not in sessions.text
+
+
+@pytest.mark.asyncio
 async def test_codex_approval_bridge_resolves_exec_request(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch, session_factory=ApprovalCodexSession)
     seen = []

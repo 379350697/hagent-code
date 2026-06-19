@@ -371,13 +371,14 @@ class CodexCommandService:
         lines = ["Codex 会话"]
         for index, record in enumerate(records[:10], start=1):
             marker = "*" if getattr(record, "thread_id", "") == selected_thread else " "
-            title = getattr(record, "title", "") or "未命名任务"
+            title = self._session_title(record)
             workspace = self._workspace_label(str(getattr(record, "workspace", "") or ""))
             thread_id = str(getattr(record, "thread_id", "") or "")
             lines.append(
                 f"{index}. {marker} {getattr(record, 'task_id', '')} · "
                 f"{thread_id[:8]} · {workspace} · "
-                f"{self._status_label(getattr(record, 'status', ''))} · {title}"
+                f"{self._session_state_label(record)} · "
+                f"最近一轮：{self._status_label(getattr(record, 'status', ''))} · {title}"
             )
         lines.append("使用 `/codex select <序号或ID>` 选择，或 `/codex resume <序号或ID> <任务>` 接续。")
         return CommandResult(
@@ -531,7 +532,7 @@ class CodexCommandService:
                     f"- {getattr(record, 'task_id', '')} · "
                     f"{str(getattr(record, 'thread_id', '') or '')[:8]} · "
                     f"{self._workspace_label(str(getattr(record, 'workspace', '') or ''))} · "
-                    f"{getattr(record, 'title', '') or '未命名任务'}"
+                    f"{self._session_title(record)}"
                 )
             return None, CommandResult("\n".join(lines), status="ambiguous")
         return matches[0], None
@@ -577,6 +578,22 @@ class CodexCommandService:
             "not_found": "未找到",
             "unknown": "未知",
         }.get(str(status or ""), str(status or ""))
+
+    @staticmethod
+    def _session_state_label(record: Any) -> str:
+        status = str(getattr(record, "status", "") or "")
+        if status in {"starting", "planning", "running", "busy"}:
+            return "进行中"
+        if getattr(record, "thread_id", ""):
+            return "可接续"
+        return "未建立会话"
+
+    @staticmethod
+    def _session_title(record: Any) -> str:
+        title = " ".join(str(getattr(record, "title", "") or "").split())
+        if _is_internal_plan_prompt_title(title):
+            return "计划会话"
+        return title or "未命名任务"
 
     def _diff(self, task_key: str, workspace: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
@@ -1118,6 +1135,10 @@ def _reviewer_label(value: Any) -> str:
     return {
         "auto_review": "自动审批",
     }.get(raw, raw)
+
+
+def _is_internal_plan_prompt_title(title: str) -> bool:
+    return title.startswith("Create a detailed implementation plan first.")
 
 
 _DEFAULT_SERVICE: CodexCommandService | None = None
