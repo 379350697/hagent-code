@@ -11,6 +11,7 @@ from typing import Any, Callable, Optional
 from agent.transports.codex_app_server_session import CodexAppServerSession
 
 from .approval import CodexApprovalBridge
+from .doctor import format_doctor_checks, run_codex_doctor
 from .event_store import CodexRuntimeEventStore
 from .formatting import (
     format_failure,
@@ -35,6 +36,7 @@ from .runtime_config import (
     normalize_sandbox_mode,
     read_codex_config_model,
 )
+from .repair import apply_recovered_turns, find_recoverable_completed_turns
 from .selection import SelectedSessionStore
 from .session_pool import CodexSessionPool, LiveSession
 from .task_keys import build_codex_task_key, task_id_for
@@ -77,7 +79,11 @@ class CodexCommandService:
         task_key = build_codex_task_key(request)
 
         if subcommand in {"status"}:
-            return self._status(task_key)
+            return self._status(request, task_key)
+        if subcommand in {"doctor", "诊断"}:
+            return self._doctor(request, task_key)
+        if subcommand in {"repair", "recover", "修复"}:
+            return self._repair(request, task_key, rest)
         if subcommand in {"events", "eventlog", "log"}:
             return self._events_status(request, task_key, rest)
         if subcommand in {"sessions", "tasks", "ls", "list"}:
@@ -162,7 +168,7 @@ class CodexCommandService:
 
         return CommandResult(
             "用法：/codex new <任务> | continue <任务> | resume <会话> <任务> | "
-            "select <会话> | status | sessions | events | "
+            "select <会话> | status | sessions | events | doctor | repair | "
             "workspace [list|set <路径或序号>|current|clear] | diff | stop | "
             "plan <任务> | permissions <default|approve-for-me|read-only|full-access>",
             status="usage",
@@ -267,11 +273,14 @@ class CodexCommandService:
         selected = self._workspace_store.set(task_key, workspace)
         return CommandResult(f"已选择 Codex 工作区：\n{selected}", status="ok")
 
-    def _status(self, task_key: str) -> CommandResult:
+    def _status(self, request: CommandRequest, task_key: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
         if record is None:
             return CommandResult("还没有 Codex 任务记录。", status="not_found")
-        text = format_task_status(record)
+        text = format_task_status(
+            record,
+            verbose=self._can_show_all_sessions(request),
+        )
         try:
             events = self._event_store.tail(
                 task_key=task_key,
@@ -284,6 +293,8 @@ class CodexCommandService:
                 workspace=str(getattr(record, "workspace", "") or ""),
                 thread_id=str(getattr(record, "thread_id", "") or ""),
             )
+            if not self._can_show_all_sessions(request):
+                progress_text = _redact_status_internal_ids(progress_text, record)
             if progress_text:
                 text = f"{text}\n\n现场进度\n{progress_text}"
         except Exception:
@@ -294,6 +305,70 @@ class CodexCommandService:
             task_id=str(getattr(record, "task_id", "") or ""),
             thread_id=str(getattr(record, "thread_id", "") or ""),
         )
+
+    def _doctor(self, request: CommandRequest, task_key: str) -> CommandResult:
+        record = self._selected_or_latest_record(task_key)
+        workspace = (
+            str(getattr(record, "workspace", "") or "")
+            if record is not None
+            else self._workspace_for(request, task_key)
+        )
+        checks = run_codex_doctor(
+            workspace=workspace,
+            task_key=task_key,
+            selected_record=record,
+            event_store=self._event_store,
+        )
+        status = "failed" if any(item.status == "fail" for item in checks) else "ok"
+        return CommandResult(
+            format_doctor_checks(checks),
+            status=status,
+            diagnostics={
+                "checks": [
+                    {"name": item.name, "status": item.status, "detail": item.detail}
+                    for item in checks
+                ]
+            },
+        )
+
+    def _repair(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        raw_args: str,
+    ) -> CommandResult:
+        args = raw_args.strip()
+        if args and not args.startswith("recovered"):
+            return CommandResult(
+                "用法：/codex repair recovered [--apply]",
+                status="usage",
+            )
+        apply = "--apply" in args.split()
+        if apply and not self._can_show_all_sessions(request):
+            return CommandResult(
+                "只有管理员诊断模式可以应用 Codex 历史修复。",
+                status="forbidden",
+            )
+        recoverable = find_recoverable_completed_turns(self._registry)
+        if not recoverable:
+            return CommandResult("没有找到可自动修复的 Codex 历史记录。", status="ok")
+        lines = [
+            "Codex 历史修复",
+            f"找到 {len(recoverable)} 条可从原生 task_complete 确认完成的记录。",
+        ]
+        for item in recoverable[:10]:
+            lines.append(
+                f"- {item.task_id} · {item.thread_id[:8]} · "
+                f"{self._workspace_label(item.workspace)} · {item.message_preview}"
+            )
+        if apply:
+            count = apply_recovered_turns(self._registry, recoverable)
+            lines.append(f"已修复 {count} 条记录为已完成。")
+            status = "ok"
+        else:
+            lines.append("这是预览；确认后用 `/codex repair recovered --apply` 应用。")
+            status = "preview"
+        return CommandResult("\n".join(lines), status=status)
 
     def _events_status(
         self,
@@ -653,6 +728,10 @@ class CodexCommandService:
                     f"{_sandbox_label(profile['sandbox'])} / "
                     f"{_approval_label(profile['approval_policy'])}{suffix}"
                 )
+            lines.append(
+                "影响范围：当前 Hermes `/codex` control-plane 的后续默认配置；"
+                "不会回写或改写历史会话记录。"
+            )
             lines.append("使用 `/codex permissions approve-for-me` 对齐桌面端“自动审批”。")
             return CommandResult(
                 "\n".join(lines),
@@ -678,7 +757,8 @@ class CodexCommandService:
         suffix = f"；审批器：{_reviewer_label(reviewer)}" if reviewer else ""
         return CommandResult(
             f"Codex 权限已切换为「{profile['label']}」："
-            f"{_sandbox_label(sandbox)} / {_approval_label(approval)}{suffix}",
+            f"{_sandbox_label(sandbox)} / {_approval_label(approval)}{suffix}\n"
+            "影响范围：后续新建或恢复的 `/codex` 运行；不会改写历史会话记录。",
             status="ok",
         )
 
@@ -1155,6 +1235,19 @@ def _reviewer_label(value: Any) -> str:
 
 def _is_internal_plan_prompt_title(title: str) -> bool:
     return title.startswith("Create a detailed implementation plan first.")
+
+
+def _redact_status_internal_ids(text: str, record: Any) -> str:
+    redacted = text
+    for value in (
+        getattr(record, "task_id", ""),
+        getattr(record, "thread_id", ""),
+    ):
+        value = str(value or "")
+        if value:
+            redacted = redacted.replace(value, "当前会话")
+            redacted = redacted.replace(value[:8], "当前会话")
+    return redacted
 
 
 _DEFAULT_SERVICE: CodexCommandService | None = None

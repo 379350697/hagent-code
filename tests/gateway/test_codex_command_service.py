@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -10,6 +11,7 @@ from gateway.control_planes.codex import (
 from gateway.control_planes.codex.event_store import CodexRuntimeEvent, CodexRuntimeEventStore
 from gateway.control_planes.codex.formatting import format_failure
 from gateway.control_planes.codex.narrator import CodexFieldNarrator
+from gateway.control_planes.codex.doctor import DoctorCheck
 
 
 class FakeCodexSession:
@@ -371,6 +373,8 @@ async def test_continue_updates_existing_session_record(tmp_path, monkeypatch) -
     assert "任务：123" in status.text
     assert "任务：456" not in status.text
     assert "轮次：turn-2" in status.text
+    assert first.task_id not in status.text
+    assert first.thread_id not in status.text
     assert first.thread_id[:8] not in sessions.text
     assert verbose_sessions.text.count(first.thread_id[:8]) == 1
 
@@ -840,6 +844,94 @@ async def test_codex_observer_timeout_is_unconfirmed_not_failed(
         CommandRequest(platform="discord", chat_id="42", text="status")
     )
     assert "最近一轮：未确认" in status.text
+
+
+@pytest.mark.asyncio
+async def test_codex_doctor_reports_health_checks(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    from gateway.control_planes.codex import service as service_mod
+
+    monkeypatch.setattr(
+        service_mod,
+        "run_codex_doctor",
+        lambda **kwargs: [
+            DoctorCheck("Codex CLI", "pass", "/usr/bin/codex"),
+            DoctorCheck("当前会话", "warn", "当前聊天还没有选中会话"),
+        ],
+    )
+
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="doctor", workspace="/repo")
+    )
+
+    assert result.status == "ok"
+    assert "Codex 诊断" in result.text
+    assert "通过 · Codex CLI" in result.text
+    assert "提醒 · 当前会话" in result.text
+
+
+@pytest.mark.asyncio
+async def test_codex_repair_recovered_preview_and_apply(
+    tmp_path, monkeypatch,
+) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+
+    codex_home = tmp_path / "codex"
+    session_dir = codex_home / "sessions" / "2999" / "01" / "01"
+    session_dir.mkdir(parents=True)
+    native_record = {
+        "timestamp": "2999-01-01T00:00:00Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "turn_id": "turn-native",
+            "last_agent_message": "真实已经完成",
+        },
+    }
+    (session_dir / "rollout-2999-thread-repair.jsonl").write_text(
+        json.dumps(native_record) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    registry = MemoryRegistry()
+    registry.upsert(
+        make_task_record(
+            task_id="repair123",
+            task_key="discord:42:main",
+            status="failed",
+            workspace="/repo",
+            thread_id="thread-repair",
+            turn_id="turn-old",
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="original",
+            last_message="Hermes observer timeout",
+        )
+    )
+    service = _service(tmp_path, monkeypatch, registry=registry)
+
+    preview = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="repair recovered")
+    )
+    applied = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="repair recovered --apply",
+            is_admin=True,
+        )
+    )
+
+    assert preview.status == "preview"
+    assert "找到 1 条" in preview.text
+    assert "真实已经完成" in preview.text
+    assert applied.status == "ok"
+    assert registry.records["repair123"].status == "completed"
+    assert registry.records["repair123"].turn_id == "turn-native"
 
 
 @pytest.mark.asyncio

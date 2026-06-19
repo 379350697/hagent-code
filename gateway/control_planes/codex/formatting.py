@@ -27,12 +27,14 @@ def format_failure(prefix: str, error: Any) -> str:
     return f"{_localize_prefix(prefix)}：{message}"
 
 
-def format_task_status(record: Any) -> str:
+def format_task_status(record: Any, *, verbose: bool = False) -> str:
     lines = [
-        f"Codex 会话：{getattr(record, 'task_id', '')}",
+        "Codex 状态",
         f"最近一轮：{_status_label(getattr(record, 'status', '') or '')}",
-        f"线程：{getattr(record, 'thread_id', '') or '未知'}",
     ]
+    if verbose:
+        lines.append(f"任务 ID：{getattr(record, 'task_id', '')}")
+        lines.append(f"线程：{getattr(record, 'thread_id', '') or '未知'}")
     turn_id = getattr(record, "turn_id", "")
     if turn_id:
         lines.append(f"轮次：{turn_id}")
