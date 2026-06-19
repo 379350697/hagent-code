@@ -839,6 +839,7 @@ async def test_codex_turn_timeouts_are_passed_to_app_server(
         lambda: {
             "turn_timeout_seconds": 2400,
             "post_tool_quiet_timeout_seconds": 45,
+            "active_tool_timeout_seconds": 7200,
             "notification_poll_timeout_seconds": 0.5,
         },
     )
@@ -851,6 +852,7 @@ async def test_codex_turn_timeouts_are_passed_to_app_server(
     options = CountingCodexSession.instances[0].run_turn_options[0]
     assert options["turn_timeout"] == 2400.0
     assert options["post_tool_quiet_timeout"] == 45.0
+    assert options["active_tool_timeout"] == 7200.0
     assert options["notification_poll_timeout"] == 0.5
     assert callable(options["progress_callback"])
 

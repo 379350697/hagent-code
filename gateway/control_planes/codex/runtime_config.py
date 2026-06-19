@@ -154,6 +154,10 @@ def codex_app_server_turn_options(cfg: dict[str, Any] | None = None) -> dict[str
         "post_tool_quiet_timeout_seconds",
         codex_cfg.get("post_tool_quiet_timeout", 90.0),
     )
+    active_tool_timeout = codex_cfg.get(
+        "active_tool_timeout_seconds",
+        codex_cfg.get("active_tool_timeout", 3600.0),
+    )
     notification_poll_timeout = codex_cfg.get(
         "notification_poll_timeout_seconds",
         codex_cfg.get("notification_poll_timeout", 0.25),
@@ -161,6 +165,7 @@ def codex_app_server_turn_options(cfg: dict[str, Any] | None = None) -> dict[str
     return {
         "turn_timeout": _positive_float(turn_timeout, 1800.0),
         "post_tool_quiet_timeout": _positive_float(post_tool_quiet_timeout, 90.0),
+        "active_tool_timeout": _positive_float(active_tool_timeout, 3600.0),
         "notification_poll_timeout": _positive_float(notification_poll_timeout, 0.25),
     }
 
