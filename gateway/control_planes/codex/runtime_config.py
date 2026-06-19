@@ -60,25 +60,25 @@ def codex_permission_profiles() -> dict[str, dict[str, str]]:
     """Desktop-aligned Codex permission profiles."""
     return {
         "default": {
-            "label": "Default",
+            "label": "默认",
             "sandbox": "workspace-write",
             "approval_policy": "on-request",
             "approvals_reviewer": "",
         },
         "auto_review": {
-            "label": "Approve for me",
+            "label": "自动审批",
             "sandbox": "workspace-write",
             "approval_policy": "on-request",
             "approvals_reviewer": "auto_review",
         },
         "read_only": {
-            "label": "Read Only",
+            "label": "只读",
             "sandbox": "read-only",
             "approval_policy": "on-request",
             "approvals_reviewer": "",
         },
         "full_access": {
-            "label": "Full Access",
+            "label": "完全访问",
             "sandbox": "danger-full-access",
             "approval_policy": "never",
             "approvals_reviewer": "",

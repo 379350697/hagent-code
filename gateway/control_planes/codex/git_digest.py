@@ -31,10 +31,10 @@ def _run_git_command(
 
 def git_digest(workspace: str) -> JsonDict:
     if not workspace:
-        return {"available": False, "error": "workspace is not set"}
+        return {"available": False, "error": "未选择工作区"}
     code, root, err = _run_git_command(workspace, ["rev-parse", "--show-toplevel"])
     if code != 0:
-        return {"available": False, "error": err or "not a git repository"}
+        return {"available": False, "error": err or "不是 git 仓库"}
     status_code, status, status_err = _run_git_command(workspace, ["status", "--short"])
     stat_code, diff_stat, stat_err = _run_git_command(workspace, ["diff", "--stat"])
     names_code, names, names_err = _run_git_command(workspace, ["diff", "--name-only"])
@@ -44,15 +44,15 @@ def git_digest(workspace: str) -> JsonDict:
     )
     files = [line for line in names.splitlines() if line]
     staged_files = [line for line in staged.splitlines() if line]
-    title_subject = "Update Codex task changes"
+    title_subject = "更新 Codex 任务变更"
     if files:
-        title_subject = f"Update {files[0]}" if len(files) == 1 else f"Update {len(files)} files"
+        title_subject = f"更新 {files[0]}" if len(files) == 1 else f"更新 {len(files)} 个文件"
     pr_body_lines = [
-        "## Summary",
-        "- Apply Codex-generated changes",
+        "## 摘要",
+        "- 应用 Codex 生成的变更",
         "",
-        "## Validation",
-        "- Not run by Hermes automatically",
+        "## 验证",
+        "- Hermes 未自动运行验证",
     ]
     return {
         "available": True,
@@ -72,21 +72,22 @@ def git_digest(workspace: str) -> JsonDict:
 
 def format_git_digest(digest: JsonDict) -> str:
     if not digest.get("available"):
-        return f"Git: unavailable ({digest.get('error') or 'unknown error'})"
-    lines = ["Git digest"]
+        return f"Git 不可用：{digest.get('error') or '未知错误'}"
+    lines = ["Git 摘要"]
     if digest.get("repoRoot"):
-        lines.append(f"Repo: {digest['repoRoot']}")
+        lines.append(f"仓库：{digest['repoRoot']}")
     if digest.get("status"):
-        lines.extend(["Status:", str(digest["status"])])
+        lines.extend(["状态：", str(digest["status"])])
     else:
-        lines.append("Status: clean")
+        lines.append("状态：干净")
     if digest.get("diffStat"):
-        lines.extend(["Diff stat:", str(digest["diffStat"])])
+        lines.extend(["变更统计：", str(digest["diffStat"])])
     files = digest.get("files") if isinstance(digest.get("files"), list) else []
     if files:
-        lines.append("Files: " + ", ".join(str(item) for item in files[:12]))
+        lines.append("文件：" + ", ".join(str(item) for item in files[:12]))
         if len(files) > 12:
-            lines.append(f"...and {len(files) - 12} more")
-    lines.append(f"Commit draft: {digest.get('commitMessageDraft') or 'Update Codex task changes'}")
-    lines.append(f"PR title draft: {digest.get('prTitleDraft') or 'Update Codex task changes'}")
+            lines.append(f"...另有 {len(files) - 12} 个")
+    fallback = "更新 Codex 任务变更"
+    lines.append(f"提交标题草稿：{digest.get('commitMessageDraft') or fallback}")
+    lines.append(f"PR 标题草稿：{digest.get('prTitleDraft') or fallback}")
     return "\n".join(lines)

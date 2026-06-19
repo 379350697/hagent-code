@@ -17,6 +17,7 @@ def make_task_record(
     plan_mode: bool,
     prompt: str,
     last_message: str,
+    title: str = "",
 ):
     from .registry import CodexTaskRecord
 
@@ -32,6 +33,13 @@ def make_task_record(
         sandbox=sandbox,
         plan_mode=plan_mode,
         plan_first="off",
-        title=" ".join(prompt.strip().split())[:80],
+        title=(title or " ".join(_strip_plan_prefix(prompt).strip().split()))[:80],
         last_message=last_message,
     )
+
+
+def _strip_plan_prefix(prompt: str) -> str:
+    marker = "confirms.\n\n"
+    if prompt.startswith("Create a detailed implementation plan first."):
+        return prompt.split(marker, 1)[1] if marker in prompt else prompt
+    return prompt

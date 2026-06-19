@@ -56,7 +56,7 @@ class CodexApprovalBridge(AbstractContextManager["CodexApprovalBridge"]):
         allow_permanent: bool = False,
     ) -> str:
         if not self.session_key or self.notify is None:
-            raise CodexApprovalError("Codex approval bridge unavailable")
+            raise CodexApprovalError("Codex 审批通道不可用")
 
         from tools.approval import request_gateway_approval
 
@@ -71,14 +71,14 @@ class CodexApprovalBridge(AbstractContextManager["CodexApprovalBridge"]):
             surface="codex_app_server",
         )
         if decision.get("notify_failed"):
-            raise CodexApprovalError("Codex approval bridge unavailable: notify failed")
+            raise CodexApprovalError("Codex 审批通道不可用：通知发送失败")
         if decision.get("reason") == "no_notify_callback":
-            raise CodexApprovalError("Codex approval bridge unavailable: no notify callback")
+            raise CodexApprovalError("Codex 审批通道不可用：没有通知回调")
         if decision.get("reason") == "no_session":
-            raise CodexApprovalError("Codex approval bridge unavailable: no session")
+            raise CodexApprovalError("Codex 审批通道不可用：没有当前会话")
         if not decision.get("resolved"):
-            raise CodexApprovalError("Codex approval timed out")
+            raise CodexApprovalError("Codex 审批已超时")
         choice = str(decision.get("choice") or "deny")
         if choice == "deny":
-            raise CodexApprovalError("Codex approval denied")
+            raise CodexApprovalError("Codex 审批已拒绝")
         return choice

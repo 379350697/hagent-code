@@ -95,14 +95,13 @@ class CodexCommandService:
             return self._permissions(rest)
         if subcommand in {"steer", "补充"}:
             return CommandResult(
-                "Codex steer is only available while the live Codex turn is running; "
-                "send a normal follow-up with `/codex continue <instruction>`.",
+                "Codex 暂不支持在运行中插话；请在本轮结束后用 `/codex continue <补充要求>` 继续。",
                 status="unsupported",
             )
         if subcommand in {"plan", "run", "new"}:
             prompt = rest.strip()
             if not prompt:
-                return CommandResult(f"Usage: /codex {subcommand} <task>", status="usage")
+                return CommandResult(f"用法：/codex {subcommand} <任务>", status="usage")
             if subcommand == "plan":
                 prompt = PLAN_PROMPT_PREFIX + prompt
             new_session = subcommand in {"run", "new"}
@@ -132,13 +131,13 @@ class CodexCommandService:
         if subcommand in {"continue", "接着"}:
             prompt = rest.strip()
             if not prompt:
-                return CommandResult("Usage: /codex continue <task>", status="usage")
+                return CommandResult("用法：/codex continue <任务>", status="usage")
             resume_record = self._selected_or_latest_record(task_key)
             live = self._sessions.peek(task_key)
             if resume_record is None and live is None:
                 return CommandResult(
-                    "No selected Codex session found for this chat. "
-                    "Use `/codex new <task>` or `/codex resume <session> <task>`.",
+                    "当前聊天还没有选中的 Codex 会话。请先用 `/codex new <任务>` 新开，"
+                    "或用 `/codex resume <会话> <任务>` 接续历史会话。",
                     status="not_found",
                 )
             return await self._run(
@@ -161,10 +160,10 @@ class CodexCommandService:
             )
 
         return CommandResult(
-            "Usage: /codex new <task> | continue <task> | resume <session> <task> | "
-            "select <session> | status | sessions | "
-            "workspace [list|set <path-or-number>|current|clear] | diff | stop | "
-            "plan <task> | permissions <default|approve-for-me|read-only|full-access>",
+            "用法：/codex new <任务> | continue <任务> | resume <会话> <任务> | "
+            "select <会话> | status | sessions | events | "
+            "workspace [list|set <路径或序号>|current|clear] | diff | stop | "
+            "plan <任务> | permissions <default|approve-for-me|read-only|full-access>",
             status="usage",
         )
 
@@ -186,20 +185,20 @@ class CodexCommandService:
         if action in {"current", "show"}:
             current = self._workspace_for(request, task_key)
             selected = self._workspace_store.get(task_key)
-            prefix = "Selected" if selected else "Default"
-            return CommandResult(f"Codex workspace\n{prefix}: {current}", status="ok")
+            prefix = "已选择" if selected else "默认"
+            return CommandResult(f"Codex 工作区\n{prefix}：{current}", status="ok")
 
         if action in {"clear", "reset", "unset"}:
             self._workspace_store.clear(task_key)
             return CommandResult(
-                f"Codex workspace cleared. Default: {request.workspace or os.getcwd()}",
+                f"Codex 工作区已清除。默认工作区：{request.workspace or os.getcwd()}",
                 status="ok",
             )
 
         if action in {"set", "use", "select"}:
             if not value:
                 return CommandResult(
-                    "Usage: /codex workspace set <path-or-number>",
+                    "用法：/codex workspace set <路径或序号>",
                     status="usage",
                 )
             return self._set_workspace(request, task_key, value)
@@ -213,21 +212,20 @@ class CodexCommandService:
         roots = workspace_scan_roots(request.workspace)
         entries = discover_git_workspaces(roots)
         current = self._workspace_for(request, task_key)
-        lines = ["Codex workspaces"]
-        lines.append(f"Current: {current}")
+        lines = ["Codex 工作区"]
+        lines.append(f"当前：{current}")
         if not entries:
-            lines.append("No git repositories found.")
+            lines.append("没有找到 git 仓库。")
             lines.append(
-                "Set HERMES_CODEX_WORKSPACE_ROOTS with colon-separated roots "
-                "to widen discovery."
+                "可以设置 HERMES_CODEX_WORKSPACE_ROOTS，用冒号分隔多个扫描根目录。"
             )
             return CommandResult("\n".join(lines), status="not_found")
         for index, entry in enumerate(entries[:20], start=1):
             marker = "*" if os.path.abspath(entry.path) == os.path.abspath(current) else " "
             lines.append(f"{marker} {index}. {entry.path}")
         if len(entries) > 20:
-            lines.append(f"...and {len(entries) - 20} more")
-        lines.append("Use `/codex workspace set <number-or-path>`.")
+            lines.append(f"...另有 {len(entries) - 20} 个")
+        lines.append("使用 `/codex workspace set <序号或路径>` 选择工作区。")
         return CommandResult(
             "\n".join(lines),
             status="ok",
@@ -246,32 +244,32 @@ class CodexCommandService:
             index = int(workspace)
             if index < 1 or index > len(entries):
                 return CommandResult(
-                    f"Codex workspace not found: index {index}",
+                    f"没有找到这个工作区序号：{index}",
                     status="not_found",
                 )
             workspace = entries[index - 1].path
         workspace = os.path.abspath(os.path.expanduser(workspace))
         if not os.path.isdir(workspace):
             return CommandResult(
-                f"Codex workspace not found: {workspace}",
+                f"没有找到这个工作区：{workspace}",
                 status="not_found",
             )
         if not os.path.exists(os.path.join(workspace, ".git")):
             digest = git_digest(workspace)
             if not digest.get("available"):
                 return CommandResult(
-                    f"Codex workspace is not a git repository: {workspace}",
+                    f"这个工作区不是 git 仓库：{workspace}",
                     status="failed",
                 )
             repo_root = str(digest.get("repoRoot") or workspace)
             workspace = repo_root
         selected = self._workspace_store.set(task_key, workspace)
-        return CommandResult(f"Codex workspace selected:\n{selected}", status="ok")
+        return CommandResult(f"已选择 Codex 工作区：\n{selected}", status="ok")
 
     def _status(self, task_key: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
         if record is None:
-            return CommandResult("Codex: no task found.", status="not_found")
+            return CommandResult("还没有 Codex 任务记录。", status="not_found")
         text = format_task_status(record)
         try:
             events = self._event_store.tail(
@@ -306,14 +304,14 @@ class CodexCommandService:
         if selector:
             if selector == "all" and not self._can_show_all_sessions(request):
                 return CommandResult(
-                    "Codex events all is only available in admin diagnostics mode.",
+                    "只有管理员诊断模式可以查看所有 Codex 事件。",
                     status="forbidden",
                 )
             if selector == "all":
                 events = self._event_store.tail(limit=20)
                 if not events:
-                    return CommandResult("Codex events: no runtime events found.", status="not_found")
-                lines = ["Codex events"]
+                    return CommandResult("没有找到 Codex 运行事件。", status="not_found")
+                lines = ["Codex 事件"]
                 for event in events[-10:]:
                     lines.append(self._narrator.format_event_line(event))
                 return CommandResult("\n".join(lines), status="ok")
@@ -324,7 +322,7 @@ class CodexCommandService:
         else:
             record = self._selected_or_latest_record(task_key)
         if record is None:
-            return CommandResult("Codex: no session found for events.", status="not_found")
+            return CommandResult("没有可查看事件的 Codex 会话。", status="not_found")
         events = self._event_store.tail(
             task_key=task_key,
             task_id=str(getattr(record, "task_id", "") or ""),
@@ -332,8 +330,8 @@ class CodexCommandService:
             limit=20,
         )
         if not events:
-            return CommandResult("Codex events: no runtime events found.", status="not_found")
-        lines = ["Codex events"]
+            return CommandResult("没有找到 Codex 运行事件。", status="not_found")
+        lines = ["Codex 事件"]
         for event in events[-10:]:
             lines.append(self._narrator.format_event_line(event))
         return CommandResult(
@@ -354,7 +352,7 @@ class CodexCommandService:
         workspace_query = ""
         if include_all and not self._can_show_all_sessions(request):
             return CommandResult(
-                "Codex sessions all is only available in admin diagnostics mode.",
+                "只有管理员诊断模式可以查看所有 Codex 会话。",
                 status="forbidden",
             )
         if args.startswith("workspace "):
@@ -367,21 +365,21 @@ class CodexCommandService:
             limit=50,
         )
         if not records:
-            return CommandResult("Codex: no sessions found for this scope.", status="not_found")
+            return CommandResult("当前范围内没有 Codex 会话。", status="not_found")
         selected = self._selected_or_latest_record(task_key)
         selected_thread = str(getattr(selected, "thread_id", "") or "")
-        lines = ["Codex sessions"]
+        lines = ["Codex 会话"]
         for index, record in enumerate(records[:10], start=1):
             marker = "*" if getattr(record, "thread_id", "") == selected_thread else " "
-            title = getattr(record, "title", "") or "(untitled)"
+            title = getattr(record, "title", "") or "未命名任务"
             workspace = self._workspace_label(str(getattr(record, "workspace", "") or ""))
             thread_id = str(getattr(record, "thread_id", "") or "")
             lines.append(
                 f"{index}. {marker} {getattr(record, 'task_id', '')} · "
                 f"{thread_id[:8]} · {workspace} · "
-                f"{getattr(record, 'status', '')} · {title}"
+                f"{self._status_label(getattr(record, 'status', ''))} · {title}"
             )
-        lines.append("Use `/codex select <number-or-id>` or `/codex resume <number-or-id> <task>`.")
+        lines.append("使用 `/codex select <序号或ID>` 选择，或 `/codex resume <序号或ID> <任务>` 接续。")
         return CommandResult(
             "\n".join(lines),
             status="ok",
@@ -405,7 +403,7 @@ class CodexCommandService:
     ) -> CommandResult:
         selector = raw_selector.strip()
         if not selector:
-            return CommandResult("Usage: /codex select <session>", status="usage")
+            return CommandResult("用法：/codex select <会话>", status="usage")
         record, error = self._resolve_session_selector(request, task_key, selector)
         if error is not None:
             return error
@@ -417,10 +415,10 @@ class CodexCommandService:
             workspace=str(getattr(record, "workspace", "") or ""),
         )
         return CommandResult(
-            "Codex session selected\n"
-            f"Task: {getattr(record, 'task_id', '')}\n"
-            f"Thread: {getattr(record, 'thread_id', '')}\n"
-            f"Workspace: {getattr(record, 'workspace', '')}",
+            "已选择 Codex 会话\n"
+            f"任务：{getattr(record, 'task_id', '')}\n"
+            f"线程：{getattr(record, 'thread_id', '')}\n"
+            f"工作区：{getattr(record, 'workspace', '')}",
             status="ok",
             task_id=str(getattr(record, "task_id", "") or ""),
             thread_id=str(getattr(record, "thread_id", "") or ""),
@@ -434,10 +432,10 @@ class CodexCommandService:
     ) -> CommandResult:
         parts = raw_args.strip().split(maxsplit=1)
         if len(parts) < 2:
-            return CommandResult("Usage: /codex resume <session> <task>", status="usage")
+            return CommandResult("用法：/codex resume <会话> <任务>", status="usage")
         selector, prompt = parts[0], parts[1].strip()
         if not prompt:
-            return CommandResult("Usage: /codex resume <session> <task>", status="usage")
+            return CommandResult("用法：/codex resume <会话> <任务>", status="usage")
         record, error = self._resolve_session_selector(request, task_key, selector)
         if error is not None:
             return error
@@ -511,7 +509,7 @@ class CodexCommandService:
             if 1 <= index <= len(records):
                 return records[index - 1], None
             return None, CommandResult(
-                f"Codex session not found: index {index}",
+                f"没有找到这个 Codex 会话序号：{index}",
                 status="not_found",
             )
         lowered = selector.lower()
@@ -523,17 +521,17 @@ class CodexCommandService:
         ]
         if not matches:
             return None, CommandResult(
-                f"Codex session not found: {selector}",
+                f"没有找到这个 Codex 会话：{selector}",
                 status="not_found",
             )
         if len(matches) > 1:
-            lines = ["Codex session selector is ambiguous"]
+            lines = ["这个会话选择不唯一，请用更长的 ID 或序号"]
             for record in matches[:5]:
                 lines.append(
                     f"- {getattr(record, 'task_id', '')} · "
                     f"{str(getattr(record, 'thread_id', '') or '')[:8]} · "
                     f"{self._workspace_label(str(getattr(record, 'workspace', '') or ''))} · "
-                    f"{getattr(record, 'title', '') or '(untitled)'}"
+                    f"{getattr(record, 'title', '') or '未命名任务'}"
                 )
             return None, CommandResult("\n".join(lines), status="ambiguous")
         return matches[0], None
@@ -564,7 +562,21 @@ class CodexCommandService:
     @staticmethod
     def _workspace_label(workspace: str) -> str:
         workspace = workspace.rstrip(os.sep)
-        return os.path.basename(workspace) if workspace else "(unknown)"
+        return os.path.basename(workspace) if workspace else "未知工作区"
+
+    @staticmethod
+    def _status_label(status: Any) -> str:
+        return {
+            "starting": "启动中",
+            "planning": "规划中",
+            "running": "运行中",
+            "completed": "已完成",
+            "failed": "失败",
+            "interrupted": "已中断",
+            "busy": "忙碌",
+            "not_found": "未找到",
+            "unknown": "未知",
+        }.get(str(status or ""), str(status or ""))
 
     def _diff(self, task_key: str, workspace: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
@@ -583,7 +595,7 @@ class CodexCommandService:
         live = self._sessions.peek(task_key)
         if live is None:
             return CommandResult(
-                "Codex stop failed: no live Codex task for this chat.",
+                "停止失败：当前聊天没有正在运行的 Codex 任务。",
                 status="not_found",
             )
         try:
@@ -595,7 +607,7 @@ class CodexCommandService:
                     completed_at=time.time(),
                     last_message="Codex stop requested.",
                 )
-            return CommandResult("Codex stop requested.", status="interrupted")
+            return CommandResult("已请求停止 Codex。", status="interrupted")
         except Exception as exc:
             return CommandResult(format_failure("Codex app-server failed", exc), status="failed")
 
@@ -603,26 +615,27 @@ class CodexCommandService:
         value = normalize_permission_profile(raw_value)
         profiles = codex_permission_profiles()
         if not raw_value.strip():
-            lines = ["Codex permissions"]
+            lines = ["Codex 权限模式"]
             for name in ("default", "auto_review", "read_only", "full_access"):
                 profile = profiles[name]
                 suffix = (
-                    f" / {profile['approvals_reviewer']}"
+                    f"；审批器：{_reviewer_label(profile['approvals_reviewer'])}"
                     if profile.get("approvals_reviewer")
                     else ""
                 )
                 lines.append(
-                    f"- {name.replace('_', '-')}: "
-                    f"{profile['sandbox']} / {profile['approval_policy']}{suffix}"
+                    f"- {name.replace('_', '-')}：{profile['label']} · "
+                    f"{_sandbox_label(profile['sandbox'])} / "
+                    f"{_approval_label(profile['approval_policy'])}{suffix}"
                 )
-            lines.append("Use `/codex permissions approve-for-me` to match desktop Approve for me.")
+            lines.append("使用 `/codex permissions approve-for-me` 对齐桌面端“自动审批”。")
             return CommandResult(
                 "\n".join(lines),
                 status="usage",
             )
         if not value or value not in profiles:
             return CommandResult(
-                "Unknown Codex permission mode. Use default, approve-for-me, read-only, or full-access.",
+                "未知的 Codex 权限模式。可用：default、approve-for-me、read-only、full-access。",
                 status="usage",
             )
         profile = profiles[value]
@@ -637,9 +650,10 @@ class CodexCommandService:
             save_config_value("codex_app_server.approvals_reviewer", reviewer)
         except Exception:
             logger.debug("Could not persist codex permission mode", exc_info=True)
-        suffix = f" / {reviewer}" if reviewer else ""
+        suffix = f"；审批器：{_reviewer_label(reviewer)}" if reviewer else ""
         return CommandResult(
-            f"Codex permissions set to {profile['label']}: {sandbox} / {approval}{suffix}.",
+            f"Codex 权限已切换为「{profile['label']}」："
+            f"{_sandbox_label(sandbox)} / {_approval_label(approval)}{suffix}",
             status="ok",
         )
 
@@ -686,8 +700,7 @@ class CodexCommandService:
         if prelocked_live is not None:
             if not prelocked_live.lock.acquire(blocking=False):
                 return CommandResult(
-                    "Codex app-server failed: a Codex task is already running for this chat. "
-                    "Use `/codex stop` or wait for it to finish.",
+                    "当前聊天已有 Codex 任务在运行。请等待它完成，或用 `/codex stop` 停止。",
                     status="busy",
                 )
             acquired_live = prelocked_live
@@ -702,8 +715,7 @@ class CodexCommandService:
             if acquired_live is not None:
                 acquired_live.lock.release()
             return CommandResult(
-                "No live Codex app-server session found for this chat. "
-                "Use `/codex new <task>` to start a fresh session.",
+                "当前聊天没有正在运行的 Codex app-server 会话。请用 `/codex new <任务>` 新开一轮。",
                 status="not_found",
             )
         if acquired_live is not live:
@@ -711,15 +723,13 @@ class CodexCommandService:
                 acquired_live.lock.release()
             if not live.lock.acquire(blocking=False):
                 return CommandResult(
-                    "Codex app-server failed: a Codex task is already running for this chat. "
-                    "Use `/codex stop` or wait for it to finish.",
+                    "当前聊天已有 Codex 任务在运行。请等待它完成，或用 `/codex stop` 停止。",
                     status="busy",
                 )
             acquired_live = live
         if acquired_live is None:
             return CommandResult(
-                "Codex app-server failed: a Codex task is already running for this chat. "
-                "Use `/codex stop` or wait for it to finish.",
+                "当前聊天已有 Codex 任务在运行。请等待它完成，或用 `/codex stop` 停止。",
                 status="busy",
             )
         bridge = CodexApprovalBridge(
@@ -1038,35 +1048,6 @@ class CodexCommandService:
             return 60.0
         return value if value > 0 else 60.0
 
-    @staticmethod
-    def _format_progress_text(
-        stage: str,
-        *,
-        workspace: str,
-        thread_id: str,
-        event: dict[str, Any],
-    ) -> str:
-        workspace_name = os.path.basename(workspace.rstrip(os.sep)) or workspace
-        thread_short = thread_id[:13] if thread_id else "pending"
-        if stage == "turn_started":
-            return (
-                "Codex is running\n"
-                f"Workspace: {workspace_name} · Session: {thread_short}"
-            )
-        if stage == "approval_requested":
-            return "Codex is waiting for command approval."
-        if stage == "tool_completed":
-            count = int(event.get("tool_iterations") or 0)
-            suffix = f" ({count} tool step{'s' if count != 1 else ''})" if count else ""
-            return f"Codex made progress{suffix}."
-        if stage == "waiting":
-            idle = int(float(event.get("idle_seconds") or 0))
-            return f"Codex is still running. Last app-server activity was {idle}s ago."
-        if stage == "turn_timed_out":
-            timeout = int(float(event.get("timeout_seconds") or 0))
-            return f"Codex task timed out after {timeout}s without app-server activity."
-        return ""
-
     def _session_record(self, task_key: str, thread_id: str) -> Any:
         try:
             records = self._registry.list(task_key=task_key, limit=50)
@@ -1112,6 +1093,32 @@ class CodexCommandService:
             result.append(canonical)
         result.sort(key=lambda record: getattr(record, "updated_at", 0) or 0, reverse=True)
         return result
+
+
+def _sandbox_label(value: Any) -> str:
+    raw = str(value or "")
+    return {
+        "workspace-write": "工作区可写",
+        "read-only": "只读",
+        "danger-full-access": "完全访问",
+    }.get(raw, raw)
+
+
+def _approval_label(value: Any) -> str:
+    raw = str(value or "")
+    return {
+        "on-request": "按需审批",
+        "never": "无需审批",
+        "untrusted": "严格审批",
+    }.get(raw, raw)
+
+
+def _reviewer_label(value: Any) -> str:
+    raw = str(value or "")
+    return {
+        "auto_review": "自动审批",
+    }.get(raw, raw)
+
 
 _DEFAULT_SERVICE: CodexCommandService | None = None
 _DEFAULT_SERVICE_LOCK = threading.Lock()

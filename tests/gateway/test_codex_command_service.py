@@ -348,9 +348,9 @@ async def test_continue_updates_existing_session_record(tmp_path, monkeypatch) -
     assert first.thread_id == second.thread_id
     assert first.task_id == second.task_id
     assert len(service._registry.records) == 1
-    assert "Task: 123" in status.text
-    assert "Task: 456" not in status.text
-    assert "Turn: turn-2" in status.text
+    assert "任务：123" in status.text
+    assert "任务：456" not in status.text
+    assert "轮次：turn-2" in status.text
     assert sessions.text.count(first.thread_id[:8]) == 1
 
 
@@ -429,7 +429,7 @@ async def test_resume_selector_continues_old_workspace_after_workspace_switch(
 
     assert first.thread_id != second.thread_id
     assert resumed.thread_id == first.thread_id
-    assert f"Workspace: {repo_a}" in resumed.text
+    assert f"工作区：{repo_a}" in resumed.text
     assert CountingCodexSession.instances[-1].resume_thread_id == first.thread_id
     assert CountingCodexSession.instances[-1].cwd == str(repo_a)
 
@@ -660,6 +660,22 @@ async def test_plan_continues_live_session_when_present(tmp_path, monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_plan_session_title_uses_user_task_not_internal_prompt(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch)
+
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="plan 增加中文进度", workspace="/repo")
+    )
+    sessions = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="sessions", workspace="/repo")
+    )
+
+    assert sessions.status == "ok"
+    assert "增加中文进度" in sessions.text
+    assert "Create a detailed implementation plan first" not in sessions.text
+
+
+@pytest.mark.asyncio
 async def test_codex_approval_bridge_resolves_exec_request(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch, session_factory=ApprovalCodexSession)
     seen = []
@@ -703,7 +719,7 @@ async def test_codex_approval_bridge_unavailable_is_explicit(
     )
 
     assert result.status == "failed"
-    assert "Codex approval bridge unavailable" in result.text
+    assert "Codex 审批通道不可用" in result.text
 
 
 @pytest.mark.asyncio
@@ -822,7 +838,7 @@ async def test_codex_runtime_events_are_persisted_and_queryable(
         CommandRequest(platform="discord", chat_id="42", text="events", workspace="/repo")
     )
     assert events_result.status == "ok"
-    assert "Codex events" in events_result.text
+    assert "Codex 事件" in events_result.text
     assert "codex.notification" in events_result.text
 
 
@@ -965,7 +981,8 @@ async def test_codex_permissions_match_desktop_profiles(
     )
 
     assert result.status == "ok"
-    assert "Approve for me" in result.text
+    assert "自动审批" in result.text
+    assert "工作区可写 / 按需审批" in result.text
     assert saved == {
         "codex_app_server.sandbox": "workspace-write",
         "codex_app_server.approval_policy": "on-request",
@@ -997,7 +1014,7 @@ async def test_codex_permissions_full_access_profile(
     )
 
     assert result.status == "ok"
-    assert "Full Access" in result.text
+    assert "完全访问 / 无需审批" in result.text
     assert saved == {
         "codex_app_server.sandbox": "danger-full-access",
         "codex_app_server.approval_policy": "never",
@@ -1072,7 +1089,7 @@ async def test_codex_start_timeout_is_reported_without_platform_failure(
     )
 
     assert result.status == "failed"
-    assert "Codex task timed out" in result.text
+    assert "Codex 任务超时" in result.text
     assert result.diagnostics["phase"] == "thread/start"
 
 
@@ -1100,7 +1117,7 @@ async def test_workspace_list_and_selection_drive_new_session(tmp_path, monkeypa
 
     assert selected.status == "ok"
     assert str(repo_b) in selected.text
-    assert f"Workspace: {repo_b}" in result.text
+    assert f"工作区：{repo_b}" in result.text
 
 
 @pytest.mark.asyncio
@@ -1127,4 +1144,4 @@ async def test_workspace_selection_is_platform_scoped(tmp_path, monkeypatch) -> 
 
     assert discord_selected.status == "ok"
     assert str(repo) in discord_selected.text
-    assert "Default: /default" in telegram_current.text
+    assert "默认：/default" in telegram_current.text
