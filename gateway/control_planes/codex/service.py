@@ -11,6 +11,7 @@ from typing import Any, Callable, Optional
 from agent.transports.codex_app_server_session import CodexAppServerSession
 
 from .approval import CodexApprovalBridge
+from .event_store import CodexRuntimeEventStore
 from .formatting import (
     format_failure,
     format_run_failure,
@@ -20,6 +21,7 @@ from .formatting import (
 from .execution import run_blocking
 from .git_digest import format_git_digest, git_digest
 from .models import CommandRequest, CommandResult
+from .narrator import CodexFieldNarrator, event_type_from_progress
 from .registry import CodexTaskRegistry
 from .records import make_task_record
 from .runtime_config import (
@@ -54,6 +56,8 @@ class CodexCommandService:
         workspace_store: Any = None,
         selected_store: Any = None,
         session_factory: Optional[Callable[..., CodexAppServerSession]] = None,
+        event_store: Any = None,
+        narrator: CodexFieldNarrator | None = None,
     ) -> None:
         if registry is None:
             registry = CodexTaskRegistry()
@@ -61,6 +65,8 @@ class CodexCommandService:
         self._workspace_store = workspace_store or WorkspaceSelectionStore()
         self._selected_store = selected_store or SelectedSessionStore()
         self._sessions = CodexSessionPool(session_factory=session_factory)
+        self._event_store = event_store or CodexRuntimeEventStore()
+        self._narrator = narrator or CodexFieldNarrator()
 
     async def handle(self, request: CommandRequest) -> CommandResult:
         raw_args = (request.text or "").strip()
@@ -71,6 +77,8 @@ class CodexCommandService:
 
         if subcommand in {"status"}:
             return self._status(task_key)
+        if subcommand in {"events", "eventlog", "log"}:
+            return self._events_status(request, task_key, rest)
         if subcommand in {"sessions", "tasks", "ls", "list"}:
             return self._sessions_status(request, task_key, rest)
         if subcommand in {"select", "use"}:
@@ -264,9 +272,73 @@ class CodexCommandService:
         record = self._selected_or_latest_record(task_key)
         if record is None:
             return CommandResult("Codex: no task found.", status="not_found")
+        text = format_task_status(record)
+        try:
+            events = self._event_store.tail(
+                task_key=task_key,
+                task_id=str(getattr(record, "task_id", "") or ""),
+                thread_id=str(getattr(record, "thread_id", "") or ""),
+                limit=30,
+            )
+            progress_text = self._narrator.status_text(
+                events,
+                workspace=str(getattr(record, "workspace", "") or ""),
+                thread_id=str(getattr(record, "thread_id", "") or ""),
+            )
+            if progress_text:
+                text = f"{text}\n\n现场进度\n{progress_text}"
+        except Exception:
+            logger.debug("Codex status event projection failed", exc_info=True)
         return CommandResult(
-            format_task_status(record),
+            text,
             status=str(getattr(record, "status", "unknown") or "unknown"),
+            task_id=str(getattr(record, "task_id", "") or ""),
+            thread_id=str(getattr(record, "thread_id", "") or ""),
+        )
+
+    def _events_status(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        raw_selector: str = "",
+    ) -> CommandResult:
+        selector = raw_selector.strip()
+        if selector:
+            if selector == "all" and not self._can_show_all_sessions(request):
+                return CommandResult(
+                    "Codex events all is only available in admin diagnostics mode.",
+                    status="forbidden",
+                )
+            if selector == "all":
+                events = self._event_store.tail(limit=20)
+                if not events:
+                    return CommandResult("Codex events: no runtime events found.", status="not_found")
+                lines = ["Codex events"]
+                for event in events[-10:]:
+                    lines.append(self._narrator.format_event_line(event))
+                return CommandResult("\n".join(lines), status="ok")
+            record, error = self._resolve_session_selector(request, task_key, selector)
+            if error is not None:
+                return error
+            assert record is not None
+        else:
+            record = self._selected_or_latest_record(task_key)
+        if record is None:
+            return CommandResult("Codex: no session found for events.", status="not_found")
+        events = self._event_store.tail(
+            task_key=task_key,
+            task_id=str(getattr(record, "task_id", "") or ""),
+            thread_id=str(getattr(record, "thread_id", "") or ""),
+            limit=20,
+        )
+        if not events:
+            return CommandResult("Codex events: no runtime events found.", status="not_found")
+        lines = ["Codex events"]
+        for event in events[-10:]:
+            lines.append(self._narrator.format_event_line(event))
+        return CommandResult(
+            "\n".join(lines),
+            status="ok",
             task_id=str(getattr(record, "task_id", "") or ""),
             thread_id=str(getattr(record, "thread_id", "") or ""),
         )
@@ -672,6 +744,7 @@ class CodexCommandService:
                     live.session.set_approval_callback(approval_callback)
                 return self._run_locked(
                     live,
+                    request,
                     task_key,
                     prompt,
                     workspace,
@@ -692,6 +765,7 @@ class CodexCommandService:
     def _run_locked(
         self,
         live: LiveSession,
+        request: CommandRequest,
         task_key: str,
         prompt: str,
         workspace: str,
@@ -725,9 +799,12 @@ class CodexCommandService:
         live.active_task_id = task_id
         progress_callback = self._progress_callback(
             progress_notify,
+            task_key=task_key,
             task_id=task_id,
             thread_id=thread_id,
             workspace=workspace,
+            platform=request.platform,
+            chat_id=request.chat_id,
             interval_seconds=self._progress_interval_seconds(codex_cfg),
         )
         if record is None:
@@ -789,6 +866,22 @@ class CodexCommandService:
             last_message=last_message,
             token_usage=getattr(turn, "token_usage_total", None) or {},
         )
+        self._append_runtime_event(
+            task_key=task_key,
+            task_id=task_id,
+            thread_id=thread_id,
+            turn_id=getattr(turn, "turn_id", None) or "",
+            platform=request.platform,
+            chat_id=request.chat_id,
+            event_type="turn.failed" if getattr(turn, "error", None) else "turn.completed",
+            payload={
+                "status": status,
+                "error": str(getattr(turn, "error", "") or ""),
+                "interrupted": bool(getattr(turn, "interrupted", False)),
+            },
+            notify=progress_notify,
+            workspace=workspace,
+        )
         if getattr(turn, "should_retire", False):
             self._sessions.retire(task_key, live)
 
@@ -806,51 +899,136 @@ class CodexCommandService:
             diagnostics={"turn_id": getattr(turn, "turn_id", None) or ""},
         )
 
-    @staticmethod
     def _progress_callback(
+        self,
         notify: Callable[[dict[str, Any]], None] | None,
         *,
+        task_key: str,
         task_id: str,
         thread_id: str,
         workspace: str,
+        platform: str,
+        chat_id: str,
         interval_seconds: float,
     ) -> Callable[[dict[str, Any]], None] | None:
-        if notify is None:
-            return None
         last_emit_at = 0.0
-        forced = {
-            "turn_started",
-            "approval_requested",
-            "turn_timed_out",
-        }
+        last_by_key: dict[str, float] = {}
+        dedupe_seconds = max(5.0, interval_seconds)
 
         def callback(event: dict[str, Any]) -> None:
             nonlocal last_emit_at
-            stage = str(event.get("stage") or "")
-            now = time.monotonic()
-            if stage not in forced and (now - last_emit_at) < max(5.0, interval_seconds):
-                return
-            text = CodexCommandService._format_progress_text(
-                stage,
-                workspace=workspace,
+            event_type = event_type_from_progress(event)
+            stored = self._append_runtime_event(
+                task_key=task_key,
+                task_id=task_id,
                 thread_id=thread_id,
-                event=event,
+                turn_id=str(event.get("turn_id") or ""),
+                platform=platform,
+                chat_id=chat_id,
+                event_type=event_type,
+                payload=event,
+                notify=None,
+                workspace=workspace,
             )
-            if not text:
+            if notify is None or stored is None:
+                return
+            try:
+                recent = self._event_store.tail(task_key=task_key, task_id=task_id, limit=30)
+                narration = self._narrator.narrate(
+                    stored,
+                    recent_events=recent,
+                    workspace=workspace,
+                    thread_id=thread_id,
+                )
+            except Exception:
+                logger.debug("Codex progress narration failed", exc_info=True)
+                return
+            if narration is None:
+                return
+            now = time.monotonic()
+            dedupe_key = narration.dedupe_key or event_type
+            if (now - last_by_key.get(dedupe_key, 0.0)) < 2.0:
+                return
+            if (
+                not narration.force
+                and (now - last_emit_at) < dedupe_seconds
+                and (now - last_by_key.get(dedupe_key, 0.0)) < dedupe_seconds
+            ):
                 return
             last_emit_at = now
+            last_by_key[dedupe_key] = now
             notify(
                 {
                     "type": "codex_progress",
                     "task_id": task_id,
                     "thread_id": thread_id,
                     "workspace": workspace,
-                    "stage": stage,
-                    "text": text,
+                    "stage": event.get("stage") or event_type,
+                    "event_type": event_type,
+                    "importance": narration.importance,
+                    "dedupe_key": dedupe_key,
+                    "evidence": list(narration.evidence),
+                    "text": narration.render(),
                 }
             )
 
         return callback
+
+    def _append_runtime_event(
+        self,
+        *,
+        task_key: str,
+        task_id: str,
+        thread_id: str,
+        turn_id: str = "",
+        platform: str = "",
+        chat_id: str = "",
+        event_type: str,
+        payload: dict[str, Any],
+        notify: Callable[[dict[str, Any]], None] | None = None,
+        workspace: str = "",
+    ):
+        try:
+            stored = self._event_store.append(
+                task_key=task_key,
+                task_id=task_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                platform=platform,
+                chat_id=chat_id,
+                event_type=event_type,
+                payload=payload,
+            )
+        except Exception:
+            logger.debug("Codex runtime event append failed", exc_info=True)
+            return None
+        if notify is not None:
+            try:
+                recent = self._event_store.tail(task_key=task_key, task_id=task_id, limit=30)
+                narration = self._narrator.narrate(
+                    stored,
+                    recent_events=recent,
+                    workspace=workspace,
+                    thread_id=thread_id,
+                )
+                if narration is not None:
+                    notify(
+                        {
+                            "type": "codex_progress",
+                            "task_id": task_id,
+                            "thread_id": thread_id,
+                            "workspace": workspace,
+                            "stage": event_type,
+                            "event_type": event_type,
+                            "importance": narration.importance,
+                            "dedupe_key": narration.dedupe_key or event_type,
+                            "evidence": list(narration.evidence),
+                            "text": narration.render(),
+                        }
+                    )
+            except Exception:
+                logger.debug("Codex terminal narration failed", exc_info=True)
+        return stored
 
     @staticmethod
     def _progress_interval_seconds(codex_cfg: dict[str, Any]) -> float:

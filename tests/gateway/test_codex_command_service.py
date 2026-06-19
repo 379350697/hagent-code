@@ -7,6 +7,7 @@ from gateway.control_planes.codex import (
     CommandRequest,
     build_codex_task_key,
 )
+from gateway.control_planes.codex.event_store import CodexRuntimeEventStore
 
 
 class FakeCodexSession:
@@ -103,6 +104,72 @@ class ProgressCodexSession(FakeCodexSession):
         return super().run_turn(user_input, **options)
 
 
+class RichProgressCodexSession(FakeCodexSession):
+    def run_turn(self, user_input, **options):
+        callback = options.get("progress_callback")
+        if callback is not None:
+            callback({"stage": "turn_started"})
+            callback({"stage": "waiting", "idle_seconds": 12})
+            callback(
+                {
+                    "stage": "notification",
+                    "method": "thread/tokenUsage/updated",
+                    "notification": {
+                        "method": "thread/tokenUsage/updated",
+                        "params": {"tokenUsage": {"total": {"total": 100}}},
+                    },
+                }
+            )
+            callback(
+                {
+                    "stage": "notification",
+                    "method": "item/started",
+                    "notification": {
+                        "method": "item/started",
+                        "params": {
+                            "item": {
+                                "type": "commandExecution",
+                                "command": "rg -n codex gateway",
+                                "cwd": "/repo",
+                            }
+                        },
+                    },
+                }
+            )
+            callback(
+                {
+                    "stage": "notification",
+                    "method": "item/completed",
+                    "notification": {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "commandExecution",
+                                "command": "pytest tests/gateway",
+                                "cwd": "/repo",
+                                "aggregatedOutput": "129 passed in 18.55s",
+                                "exitCode": 0,
+                            }
+                        },
+                    },
+                }
+            )
+        return super().run_turn(user_input, **options)
+
+
+class ApprovalProgressCodexSession(FakeCodexSession):
+    def run_turn(self, user_input, **options):
+        callback = options.get("progress_callback")
+        if callback is not None:
+            request = {
+                "method": "request",
+                "params": {"command": "rg -n secret ."},
+            }
+            callback({"stage": "approval_requested", "request": request})
+            callback({"stage": "server_request", "method": "request", "request": request})
+        return super().run_turn(user_input, **options)
+
+
 class MemoryRegistry:
     def __init__(self):
         self.records = {}
@@ -185,6 +252,7 @@ def _service(
     *,
     registry=None,
     selected_store=None,
+    event_store=None,
 ):
     from gateway.control_planes.codex import service as service_mod
 
@@ -195,6 +263,7 @@ def _service(
         workspace_store=MemoryWorkspaceStore(),
         selected_store=selected_store or MemorySelectedStore(),
         session_factory=session_factory,
+        event_store=event_store or CodexRuntimeEventStore(str(tmp_path / "events.sqlite3")),
     )
 
 
@@ -686,13 +755,11 @@ async def test_codex_turn_timeouts_are_passed_to_app_server(
     )
 
     assert result.status == "completed"
-    assert CountingCodexSession.instances[0].run_turn_options == [
-        {
-            "turn_timeout": 2400.0,
-            "post_tool_quiet_timeout": 45.0,
-            "notification_poll_timeout": 0.5,
-        }
-    ]
+    options = CountingCodexSession.instances[0].run_turn_options[0]
+    assert options["turn_timeout"] == 2400.0
+    assert options["post_tool_quiet_timeout"] == 45.0
+    assert options["notification_poll_timeout"] == 0.5
+    assert callable(options["progress_callback"])
 
 
 @pytest.mark.asyncio
@@ -716,7 +783,95 @@ async def test_codex_progress_notify_reports_turn_activity(
     assert progress
     assert progress[0]["type"] == "codex_progress"
     assert progress[0]["stage"] == "turn_started"
-    assert "Codex is running" in progress[0]["text"]
+    assert "我开始接这轮任务了" in progress[0]["text"]
+    assert "证据：" in progress[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_codex_runtime_events_are_persisted_and_queryable(
+    tmp_path, monkeypatch,
+) -> None:
+    event_store = CodexRuntimeEventStore(str(tmp_path / "events.sqlite3"))
+    service = _service(
+        tmp_path,
+        monkeypatch,
+        session_factory=RichProgressCodexSession,
+        event_store=event_store,
+    )
+    progress = []
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="new inspect",
+            workspace="/repo",
+            progress_notify=lambda data: progress.append(data),
+        )
+    )
+
+    assert result.status == "completed"
+    events = event_store.tail(task_key="discord:42:main", task_id=result.task_id, limit=20)
+    assert [event.event_type for event in events]
+    assert any(event.event_type == "codex.notification" for event in events)
+    assert any(event.event_type == "usage.updated" for event in events)
+    assert any("刚跑完一轮测试" in item["text"] for item in progress)
+    assert not any(item.get("event_type") == "usage.updated" for item in progress)
+
+    events_result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="events", workspace="/repo")
+    )
+    assert events_result.status == "ok"
+    assert "Codex events" in events_result.text
+    assert "codex.notification" in events_result.text
+
+
+@pytest.mark.asyncio
+async def test_codex_runtime_event_payload_is_redacted(
+    tmp_path, monkeypatch,
+) -> None:
+    event_store = CodexRuntimeEventStore(str(tmp_path / "events.sqlite3"))
+
+    stored = event_store.append(
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        event_type="codex.notification",
+        payload={
+            "token": "secret-token",
+            "message": "Authorization: Bearer abc.def and OPENAI_API_KEY=sk-testsecret",
+            "long": "x" * 12_000,
+        },
+    )
+
+    assert stored.payload["token"] == "[REDACTED]"
+    assert "Authorization:[REDACTED]" in stored.payload["message"]
+    assert "abc.def" not in stored.payload["message"]
+    assert "OPENAI_API_KEY=[REDACTED]" in stored.payload["message"]
+    assert str(stored.payload["long"]).endswith("...<truncated>")
+
+
+@pytest.mark.asyncio
+async def test_codex_approval_progress_is_deduped(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch, session_factory=ApprovalProgressCodexSession)
+    progress = []
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="new inspect",
+            workspace="/repo",
+            progress_notify=lambda data: progress.append(data),
+        )
+    )
+
+    assert result.status == "completed"
+    approval_messages = [item for item in progress if "现在卡在审批" in item["text"]]
+    assert len(approval_messages) == 1
+    assert "待执行 rg -n secret ." in approval_messages[0]["text"]
 
 
 @pytest.mark.asyncio
