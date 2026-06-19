@@ -25,6 +25,7 @@ from .records import make_task_record
 from .runtime_config import (
     PLAN_PROMPT_PREFIX,
     codex_app_server_config_overrides,
+    codex_app_server_turn_options,
     codex_permission_profiles,
     load_codex_cfg,
     normalize_permission_profile,
@@ -607,6 +608,7 @@ class CodexCommandService:
     ) -> CommandResult:
         codex_cfg = load_codex_cfg()
         config_overrides = codex_app_server_config_overrides(codex_cfg)
+        turn_options = codex_app_server_turn_options(codex_cfg)
         prelocked_live = self._sessions.peek(task_key)
         acquired_live = None
         if prelocked_live is not None:
@@ -676,6 +678,7 @@ class CodexCommandService:
                     new_session,
                     plan_mode,
                     codex_cfg,
+                    turn_options,
                     select_session,
                 )
         finally:
@@ -694,9 +697,13 @@ class CodexCommandService:
         new_session: bool,
         plan_mode: bool,
         codex_cfg: dict[str, Any] | None = None,
+        turn_options: dict[str, float] | None = None,
         select_session: bool = False,
     ) -> CommandResult:
         codex_cfg = codex_cfg if isinstance(codex_cfg, dict) else load_codex_cfg()
+        turn_options = (
+            turn_options if isinstance(turn_options, dict) else codex_app_server_turn_options(codex_cfg)
+        )
         model = str(codex_cfg.get("model") or read_codex_config_model())
         sandbox = normalize_sandbox_mode(str(codex_cfg.get("sandbox") or "workspace-write"))
         approval = str(codex_cfg.get("approval_policy") or "on-request")
@@ -752,7 +759,7 @@ class CodexCommandService:
                 workspace=workspace,
             )
 
-        turn = live.session.run_turn(user_input=prompt)
+        turn = live.session.run_turn(user_input=prompt, **turn_options)
         status = "completed"
         last_message = "Codex: turn completed"
         if getattr(turn, "error", None):

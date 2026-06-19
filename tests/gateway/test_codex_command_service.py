@@ -27,13 +27,15 @@ class FakeCodexSession:
         self.closed = False
         self.turns = 0
         self.inputs = []
+        self.run_turn_options = []
 
     def ensure_started(self):
         return self.thread_id
 
-    def run_turn(self, user_input):
+    def run_turn(self, user_input, **options):
         self.turns += 1
         self.inputs.append(user_input)
+        self.run_turn_options.append(dict(options))
         return SimpleNamespace(
             final_text=f"ok: {user_input}",
             error=None,
@@ -65,13 +67,14 @@ class ApprovalCodexSession(FakeCodexSession):
         super().__init__(**kwargs)
         ApprovalCodexSession.last_instance = self
 
-    def run_turn(self, user_input):
+    def run_turn(self, user_input, **options):
         if self.approval_callback is not None:
             try:
                 self.approval_callback("touch file.txt", "Codex requests exec in /repo")
             except Exception as exc:
                 self.turns += 1
                 self.inputs.append(user_input)
+                self.run_turn_options.append(dict(options))
                 return SimpleNamespace(
                     final_text="",
                     error=str(exc),
@@ -80,7 +83,7 @@ class ApprovalCodexSession(FakeCodexSession):
                     turn_id=f"turn-{self.turns}",
                     token_usage_total={},
                 )
-        return super().run_turn(user_input)
+        return super().run_turn(user_input, **options)
 
 
 class CountingCodexSession(FakeCodexSession):
@@ -648,6 +651,38 @@ async def test_codex_sandbox_config_is_passed_to_app_server(
         'sandbox_mode="read-only"',
         "-c",
         'approval_policy="on-request"',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_timeouts_are_passed_to_app_server(
+    tmp_path, monkeypatch,
+) -> None:
+    CountingCodexSession.instances = []
+    service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
+    from gateway.control_planes.codex import service as service_mod
+
+    monkeypatch.setattr(
+        service_mod,
+        "load_codex_cfg",
+        lambda: {
+            "turn_timeout_seconds": 2400,
+            "post_tool_quiet_timeout_seconds": 45,
+            "notification_poll_timeout_seconds": 0.5,
+        },
+    )
+
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new inspect", workspace="/repo")
+    )
+
+    assert result.status == "completed"
+    assert CountingCodexSession.instances[0].run_turn_options == [
+        {
+            "turn_timeout": 2400.0,
+            "post_tool_quiet_timeout": 45.0,
+            "notification_poll_timeout": 0.5,
+        }
     ]
 
 

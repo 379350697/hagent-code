@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -128,6 +129,40 @@ def codex_app_server_config_overrides(cfg: dict[str, Any] | None = None) -> list
     if approvals_reviewer:
         overrides.extend(["-c", f'approvals_reviewer="{approvals_reviewer}"'])
     return overrides
+
+
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed) or parsed <= 0:
+        return default
+    return parsed
+
+
+def codex_app_server_turn_options(cfg: dict[str, Any] | None = None) -> dict[str, float]:
+    """Timeouts for a single app-server turn.
+
+    Long-running remote Codex tasks commonly exceed the transport default. Keep
+    the values configurable from Hermes while preserving the transport's
+    post-tool quiet watchdog behavior.
+    """
+    codex_cfg = cfg if isinstance(cfg, dict) else load_codex_cfg()
+    turn_timeout = codex_cfg.get("turn_timeout_seconds", codex_cfg.get("turn_timeout", 1800.0))
+    post_tool_quiet_timeout = codex_cfg.get(
+        "post_tool_quiet_timeout_seconds",
+        codex_cfg.get("post_tool_quiet_timeout", 90.0),
+    )
+    notification_poll_timeout = codex_cfg.get(
+        "notification_poll_timeout_seconds",
+        codex_cfg.get("notification_poll_timeout", 0.25),
+    )
+    return {
+        "turn_timeout": _positive_float(turn_timeout, 1800.0),
+        "post_tool_quiet_timeout": _positive_float(post_tool_quiet_timeout, 90.0),
+        "notification_poll_timeout": _positive_float(notification_poll_timeout, 0.25),
+    }
 
 
 def get_approval_callback():
