@@ -165,6 +165,11 @@ and immediately starts a new turn in that thread. Selectors may be the displayed
 number, a `task_id` prefix, or a Codex `thread_id` prefix; ambiguous prefixes
 return candidates and do not start Codex.
 
+`/codex sessions all` is diagnostic-only. Hermes should pass
+`CommandRequest.is_admin=True` only for slash users who are admins under the
+current platform/scope policy. Without that flag, the command is rejected unless
+`HERMES_CODEX_DIAGNOSTICS=1` is explicitly set for the gateway process.
+
 Discord should expose `/codex select` and `/codex resume` as native subcommands
 with autocomplete backed by the control plane's session list. Telegram can use
 the same text commands.

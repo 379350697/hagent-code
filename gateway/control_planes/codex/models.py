@@ -18,6 +18,7 @@ class CommandRequest:
     approval_chat_id: str = ""
     approval_thread_metadata: dict[str, Any] = field(default_factory=dict)
     approval_notify: Callable[[dict[str, Any]], None] | None = None
+    is_admin: bool = False
 
 
 @dataclass(frozen=True)

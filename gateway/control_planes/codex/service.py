@@ -77,7 +77,7 @@ class CodexCommandService:
         if subcommand in {"workspace", "workspaces", "cwd", "repo"}:
             return self._workspace_command(request, task_key, rest)
         if subcommand in {"diff", "git"}:
-            return self._diff(task_key, self._workspace_for(request, task_key))
+            return self._diff(task_key, "")
         if subcommand in {"stop", "interrupt", "cancel"}:
             return self._stop(task_key)
         if subcommand in {"permissions", "permission", "perms"}:
@@ -277,6 +277,11 @@ class CodexCommandService:
         args = raw_args.strip()
         include_all = args == "all"
         workspace_query = ""
+        if include_all and not self._can_show_all_sessions(request):
+            return CommandResult(
+                "Codex sessions all is only available in admin diagnostics mode.",
+                status="forbidden",
+            )
         if args.startswith("workspace "):
             workspace_query = args.split(maxsplit=1)[1].strip().lower()
         records = self._session_records_for_request(
@@ -471,13 +476,24 @@ class CodexCommandService:
         return self._registry.get(task_key=task_key)
 
     @staticmethod
+    def _can_show_all_sessions(request: CommandRequest) -> bool:
+        if bool(getattr(request, "is_admin", False)):
+            return True
+        return os.environ.get("HERMES_CODEX_DIAGNOSTICS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
     def _workspace_label(workspace: str) -> str:
         workspace = workspace.rstrip(os.sep)
         return os.path.basename(workspace) if workspace else "(unknown)"
 
     def _diff(self, task_key: str, workspace: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
-        resolved_workspace = workspace or (getattr(record, "workspace", "") if record else "")
+        resolved_workspace = (getattr(record, "workspace", "") if record else "") or workspace
         try:
             digest = git_digest(resolved_workspace or os.getcwd())
             return CommandResult(
@@ -577,6 +593,16 @@ class CodexCommandService:
     ) -> CommandResult:
         codex_cfg = load_codex_cfg()
         config_overrides = codex_app_server_config_overrides(codex_cfg)
+        prelocked_live = self._sessions.peek(task_key)
+        acquired_live = None
+        if prelocked_live is not None:
+            if not prelocked_live.lock.acquire(blocking=False):
+                return CommandResult(
+                    "Codex app-server failed: a Codex task is already running for this chat. "
+                    "Use `/codex stop` or wait for it to finish.",
+                    status="busy",
+                )
+            acquired_live = prelocked_live
         live = self._sessions.get(
             task_key,
             workspace,
@@ -585,12 +611,24 @@ class CodexCommandService:
             resume_thread_id=resume_thread_id,
         )
         if live is None:
+            if acquired_live is not None:
+                acquired_live.lock.release()
             return CommandResult(
                 "No live Codex app-server session found for this chat. "
                 "Use `/codex new <task>` to start a fresh session.",
                 status="not_found",
             )
-        if not live.lock.acquire(blocking=False):
+        if acquired_live is not live:
+            if acquired_live is not None:
+                acquired_live.lock.release()
+            if not live.lock.acquire(blocking=False):
+                return CommandResult(
+                    "Codex app-server failed: a Codex task is already running for this chat. "
+                    "Use `/codex stop` or wait for it to finish.",
+                    status="busy",
+                )
+            acquired_live = live
+        if acquired_live is None:
             return CommandResult(
                 "Codex app-server failed: a Codex task is already running for this chat. "
                 "Use `/codex stop` or wait for it to finish.",
@@ -625,7 +663,8 @@ class CodexCommandService:
             if hasattr(live.session, "set_approval_callback"):
                 live.session.set_approval_callback(None)
             live.active_task_id = ""
-            live.lock.release()
+            if acquired_live is not None:
+                acquired_live.lock.release()
 
     def _run_locked(
         self,

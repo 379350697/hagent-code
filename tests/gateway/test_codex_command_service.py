@@ -432,6 +432,132 @@ async def test_selector_ambiguity_returns_candidates_without_running(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_new_does_not_retire_running_live_session(tmp_path, monkeypatch) -> None:
+    CountingCodexSession.instances = []
+    service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
+
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace="/repo-a")
+    )
+    live = service._sessions.peek("discord:42:main")
+    assert live is not None
+    assert live.lock.acquire(blocking=False)
+    try:
+        result = await service.handle(
+            CommandRequest(platform="discord", chat_id="42", text="new second", workspace="/repo-b")
+        )
+    finally:
+        live.lock.release()
+
+    assert result.status == "busy"
+    assert len(CountingCodexSession.instances) == 1
+    assert CountingCodexSession.instances[0].closed is False
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_retire_running_live_session(tmp_path, monkeypatch) -> None:
+    CountingCodexSession.instances = []
+    service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
+    first = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace="/repo-a")
+    )
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new second", workspace="/repo-b")
+    )
+    live = service._sessions.peek("discord:42:main")
+    assert live is not None
+    assert live.lock.acquire(blocking=False)
+    try:
+        result = await service.handle(
+            CommandRequest(
+                platform="discord",
+                chat_id="42",
+                text=f"resume {first.task_id} should be busy",
+                workspace="/repo-c",
+            )
+        )
+    finally:
+        live.lock.release()
+
+    assert result.status == "busy"
+    assert CountingCodexSession.instances[-1].closed is False
+
+
+@pytest.mark.asyncio
+async def test_sessions_all_requires_admin_or_diagnostics(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch)
+
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace="/repo")
+    )
+    forbidden = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="sessions all")
+    )
+    allowed = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="sessions all", is_admin=True)
+    )
+
+    assert forbidden.status == "forbidden"
+    assert allowed.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_sessions_all_allows_explicit_diagnostics_env(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_DIAGNOSTICS", "1")
+
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace="/repo")
+    )
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="sessions all")
+    )
+
+    assert result.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_diff_uses_selected_session_workspace(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch)
+    from gateway.control_planes.codex import service as service_mod
+
+    seen = []
+
+    def fake_git_digest(workspace):
+        seen.append(workspace)
+        return {
+            "available": True,
+            "repoRoot": workspace,
+            "branch": "main",
+            "dirty": False,
+            "changedFiles": [],
+        }
+
+    monkeypatch.setattr(service_mod, "git_digest", fake_git_digest)
+    repo_a = _make_git_repo(tmp_path / "repo-a")
+    repo_b = _make_git_repo(tmp_path / "repo-b")
+
+    first = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new first", workspace=str(repo_a))
+    )
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text=f"workspace set {repo_b}")
+    )
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new second", workspace=str(repo_a))
+    )
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text=f"select {first.task_id}")
+    )
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="diff", workspace=str(repo_b))
+    )
+
+    assert result.status == "ok"
+    assert seen[-1] == str(repo_a)
+
+
+@pytest.mark.asyncio
 async def test_plan_continues_live_session_when_present(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch)
 
