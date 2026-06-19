@@ -25,7 +25,9 @@ from .records import make_task_record
 from .runtime_config import (
     PLAN_PROMPT_PREFIX,
     codex_app_server_config_overrides,
+    codex_permission_profiles,
     load_codex_cfg,
+    normalize_permission_profile,
     normalize_sandbox_mode,
     read_codex_config_model,
 )
@@ -153,7 +155,7 @@ class CodexCommandService:
             "Usage: /codex new <task> | continue <task> | resume <session> <task> | "
             "select <session> | status | sessions | "
             "workspace [list|set <path-or-number>|current|clear] | diff | stop | "
-            "plan <task> | permissions <auto|workspace|readonly|danger>",
+            "plan <task> | permissions <default|approve-for-me|read-only|full-access>",
             status="usage",
         )
 
@@ -525,36 +527,48 @@ class CodexCommandService:
             return CommandResult(format_failure("Codex app-server failed", exc), status="failed")
 
     def _permissions(self, raw_value: str) -> CommandResult:
-        value = raw_value.strip().lower()
-        if not value:
+        value = normalize_permission_profile(raw_value)
+        profiles = codex_permission_profiles()
+        if not raw_value.strip():
+            lines = ["Codex permissions"]
+            for name in ("default", "auto_review", "read_only", "full_access"):
+                profile = profiles[name]
+                suffix = (
+                    f" / {profile['approvals_reviewer']}"
+                    if profile.get("approvals_reviewer")
+                    else ""
+                )
+                lines.append(
+                    f"- {name.replace('_', '-')}: "
+                    f"{profile['sandbox']} / {profile['approval_policy']}{suffix}"
+                )
+            lines.append("Use `/codex permissions approve-for-me` to match desktop Approve for me.")
             return CommandResult(
-                "Codex permissions: auto, workspace, readonly, danger.\n"
-                "Use `/codex permissions workspace` for the safe default.",
+                "\n".join(lines),
                 status="usage",
             )
-        mapping = {
-            "auto": ("workspace-write", "on-request"),
-            "workspace": ("workspace-write", "on-request"),
-            "safe": ("workspace-write", "on-request"),
-            "readonly": ("read-only", "on-request"),
-            "read-only": ("read-only", "on-request"),
-            "danger": ("danger-full-access", "never"),
-            "yolo": ("danger-full-access", "never"),
-        }
-        if value not in mapping:
+        if not value or value not in profiles:
             return CommandResult(
-                "Unknown Codex permission mode. Use auto, workspace, readonly, or danger.",
+                "Unknown Codex permission mode. Use default, approve-for-me, read-only, or full-access.",
                 status="usage",
             )
-        sandbox, approval = mapping[value]
+        profile = profiles[value]
+        sandbox = profile["sandbox"]
+        approval = profile["approval_policy"]
+        reviewer = profile.get("approvals_reviewer", "")
         try:
             from cli import save_config_value
 
             save_config_value("codex_app_server.sandbox", sandbox)
             save_config_value("codex_app_server.approval_policy", approval)
+            save_config_value("codex_app_server.approvals_reviewer", reviewer)
         except Exception:
             logger.debug("Could not persist codex permission mode", exc_info=True)
-        return CommandResult(f"Codex permissions set to {sandbox} / {approval}.", status="ok")
+        suffix = f" / {reviewer}" if reviewer else ""
+        return CommandResult(
+            f"Codex permissions set to {profile['label']}: {sandbox} / {approval}{suffix}.",
+            status="ok",
+        )
 
     async def _run(
         self,
@@ -640,9 +654,14 @@ class CodexCommandService:
         )
         approval = str(codex_cfg.get("approval_policy") or "on-request")
         sandbox = normalize_sandbox_mode(str(codex_cfg.get("sandbox") or "workspace-write"))
+        approvals_reviewer = str(codex_cfg.get("approvals_reviewer") or "").strip()
         approval_callback = (
             (lambda *_args, **_kwargs: "session")
-            if approval == "never" or sandbox == "danger-full-access"
+            if (
+                approval == "never"
+                or approvals_reviewer == "auto_review"
+                or sandbox == "danger-full-access"
+            )
             else bridge.callback
         )
         try:

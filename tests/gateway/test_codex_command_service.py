@@ -646,6 +646,8 @@ async def test_codex_sandbox_config_is_passed_to_app_server(
     assert ApprovalCodexSession.last_instance.config_overrides == [
         "-c",
         'sandbox_mode="read-only"',
+        "-c",
+        'approval_policy="on-request"',
     ]
 
 
@@ -670,7 +672,114 @@ async def test_codex_danger_mode_auto_approves_without_notify(
     assert ApprovalCodexSession.last_instance.config_overrides == [
         "-c",
         'sandbox_mode="danger-full-access"',
+        "-c",
+        'approval_policy="never"',
     ]
+
+
+@pytest.mark.asyncio
+async def test_codex_approve_for_me_auto_reviews_without_notify(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch, session_factory=ApprovalCodexSession)
+    from gateway.control_planes.codex import service as service_mod
+
+    notified = []
+    monkeypatch.setattr(
+        service_mod,
+        "load_codex_cfg",
+        lambda: {
+            "sandbox": "workspace-write",
+            "approval_policy": "on-request",
+            "approvals_reviewer": "auto_review",
+        },
+    )
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="new write",
+            workspace="/repo",
+            approval_session_key="approval-session",
+            approval_notify=lambda data: notified.append(data),
+        )
+    )
+
+    assert result.status == "completed"
+    assert notified == []
+    assert ApprovalCodexSession.last_instance.config_overrides == [
+        "-c",
+        'sandbox_mode="workspace-write"',
+        "-c",
+        'approval_policy="on-request"',
+        "-c",
+        'approvals_reviewer="auto_review"',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_permissions_match_desktop_profiles(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    saved = {}
+
+    def fake_save_config_value(key, value):
+        saved[key] = value
+
+    import cli
+
+    monkeypatch.setattr(cli, "save_config_value", fake_save_config_value)
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="permissions approve-for-me",
+            workspace="/repo",
+        )
+    )
+
+    assert result.status == "ok"
+    assert "Approve for me" in result.text
+    assert saved == {
+        "codex_app_server.sandbox": "workspace-write",
+        "codex_app_server.approval_policy": "on-request",
+        "codex_app_server.approvals_reviewer": "auto_review",
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_permissions_full_access_profile(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    saved = {}
+
+    def fake_save_config_value(key, value):
+        saved[key] = value
+
+    import cli
+
+    monkeypatch.setattr(cli, "save_config_value", fake_save_config_value)
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="permissions full-access",
+            workspace="/repo",
+        )
+    )
+
+    assert result.status == "ok"
+    assert "Full Access" in result.text
+    assert saved == {
+        "codex_app_server.sandbox": "danger-full-access",
+        "codex_app_server.approval_policy": "never",
+        "codex_app_server.approvals_reviewer": "",
+    }
 
 
 @pytest.mark.asyncio
@@ -718,10 +827,14 @@ async def test_sandbox_config_change_recreates_live_session(tmp_path, monkeypatc
     assert CountingCodexSession.instances[0].config_overrides == [
         "-c",
         'sandbox_mode="workspace-write"',
+        "-c",
+        'approval_policy="on-request"',
     ]
     assert CountingCodexSession.instances[1].config_overrides == [
         "-c",
         'sandbox_mode="read-only"',
+        "-c",
+        'approval_policy="on-request"',
     ]
 
 

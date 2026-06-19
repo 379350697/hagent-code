@@ -55,10 +55,79 @@ def normalize_sandbox_mode(value: str) -> str:
     return aliases.get(raw, "workspace-write")
 
 
+def codex_permission_profiles() -> dict[str, dict[str, str]]:
+    """Desktop-aligned Codex permission profiles."""
+    return {
+        "default": {
+            "label": "Default",
+            "sandbox": "workspace-write",
+            "approval_policy": "on-request",
+            "approvals_reviewer": "",
+        },
+        "auto_review": {
+            "label": "Approve for me",
+            "sandbox": "workspace-write",
+            "approval_policy": "on-request",
+            "approvals_reviewer": "auto_review",
+        },
+        "read_only": {
+            "label": "Read Only",
+            "sandbox": "read-only",
+            "approval_policy": "on-request",
+            "approvals_reviewer": "",
+        },
+        "full_access": {
+            "label": "Full Access",
+            "sandbox": "danger-full-access",
+            "approval_policy": "never",
+            "approvals_reviewer": "",
+        },
+    }
+
+
+def normalize_permission_profile(value: str) -> str:
+    raw = (value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "": "default",
+        "default": "default",
+        "workspace": "default",
+        "safe": "default",
+        "on-request": "default",
+        "ask": "default",
+        "auto": "auto_review",
+        "auto-review": "auto_review",
+        "auto-reviewer": "auto_review",
+        "approve": "auto_review",
+        "approve-for-me": "auto_review",
+        "approveforme": "auto_review",
+        "read": "read_only",
+        "readonly": "read_only",
+        "read-only": "read_only",
+        "read-only-mode": "read_only",
+        "full": "full_access",
+        "full-access": "full_access",
+        "danger": "full_access",
+        "danger-full-access": "full_access",
+        "danger-no-sandbox": "full_access",
+        "yolo": "full_access",
+    }
+    return aliases.get(raw, "")
+
+
 def codex_app_server_config_overrides(cfg: dict[str, Any] | None = None) -> list[str]:
     codex_cfg = cfg if isinstance(cfg, dict) else load_codex_cfg()
     sandbox = normalize_sandbox_mode(str(codex_cfg.get("sandbox") or "workspace-write"))
-    return ["-c", f'sandbox_mode="{sandbox}"']
+    approval_policy = str(codex_cfg.get("approval_policy") or "on-request").strip() or "on-request"
+    approvals_reviewer = str(codex_cfg.get("approvals_reviewer") or "").strip()
+    overrides = [
+        "-c",
+        f'sandbox_mode="{sandbox}"',
+        "-c",
+        f'approval_policy="{approval_policy}"',
+    ]
+    if approvals_reviewer:
+        overrides.extend(["-c", f'approvals_reviewer="{approvals_reviewer}"'])
+    return overrides
 
 
 def get_approval_callback():

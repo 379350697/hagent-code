@@ -10,7 +10,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HERMES_ROOT = Path(os.environ["HERMES_AGENT"]).resolve() if os.environ.get("HERMES_AGENT") else ROOT
+HERMES_ROOT = Path(os.environ.get("HERMES_AGENT", ROOT)).resolve()
 
 
 def _imports(path: str, *, root: Path = ROOT) -> set[str]:
