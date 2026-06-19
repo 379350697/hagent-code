@@ -679,6 +679,7 @@ class CodexCommandService:
                     plan_mode,
                     codex_cfg,
                     turn_options,
+                    request.progress_notify,
                     select_session,
                 )
         finally:
@@ -698,6 +699,7 @@ class CodexCommandService:
         plan_mode: bool,
         codex_cfg: dict[str, Any] | None = None,
         turn_options: dict[str, float] | None = None,
+        progress_notify: Callable[[dict[str, Any]], None] | None = None,
         select_session: bool = False,
     ) -> CommandResult:
         codex_cfg = codex_cfg if isinstance(codex_cfg, dict) else load_codex_cfg()
@@ -721,6 +723,13 @@ class CodexCommandService:
         record = None if new_session else self._session_record(task_key, thread_id)
         task_id = getattr(record, "task_id", "") or task_id_for(thread_id)
         live.active_task_id = task_id
+        progress_callback = self._progress_callback(
+            progress_notify,
+            task_id=task_id,
+            thread_id=thread_id,
+            workspace=workspace,
+            interval_seconds=self._progress_interval_seconds(codex_cfg),
+        )
         if record is None:
             self._registry.upsert(
                 make_task_record(
@@ -759,7 +768,10 @@ class CodexCommandService:
                 workspace=workspace,
             )
 
-        turn = live.session.run_turn(user_input=prompt, **turn_options)
+        run_turn_kwargs = dict(turn_options)
+        if progress_callback is not None:
+            run_turn_kwargs["progress_callback"] = progress_callback
+        turn = live.session.run_turn(user_input=prompt, **run_turn_kwargs)
         status = "completed"
         last_message = "Codex: turn completed"
         if getattr(turn, "error", None):
@@ -793,6 +805,89 @@ class CodexCommandService:
             thread_id=thread_id,
             diagnostics={"turn_id": getattr(turn, "turn_id", None) or ""},
         )
+
+    @staticmethod
+    def _progress_callback(
+        notify: Callable[[dict[str, Any]], None] | None,
+        *,
+        task_id: str,
+        thread_id: str,
+        workspace: str,
+        interval_seconds: float,
+    ) -> Callable[[dict[str, Any]], None] | None:
+        if notify is None:
+            return None
+        last_emit_at = 0.0
+        forced = {
+            "turn_started",
+            "approval_requested",
+            "turn_timed_out",
+        }
+
+        def callback(event: dict[str, Any]) -> None:
+            nonlocal last_emit_at
+            stage = str(event.get("stage") or "")
+            now = time.monotonic()
+            if stage not in forced and (now - last_emit_at) < max(5.0, interval_seconds):
+                return
+            text = CodexCommandService._format_progress_text(
+                stage,
+                workspace=workspace,
+                thread_id=thread_id,
+                event=event,
+            )
+            if not text:
+                return
+            last_emit_at = now
+            notify(
+                {
+                    "type": "codex_progress",
+                    "task_id": task_id,
+                    "thread_id": thread_id,
+                    "workspace": workspace,
+                    "stage": stage,
+                    "text": text,
+                }
+            )
+
+        return callback
+
+    @staticmethod
+    def _progress_interval_seconds(codex_cfg: dict[str, Any]) -> float:
+        try:
+            value = float(codex_cfg.get("progress_interval_seconds") or 60.0)
+        except (TypeError, ValueError):
+            return 60.0
+        return value if value > 0 else 60.0
+
+    @staticmethod
+    def _format_progress_text(
+        stage: str,
+        *,
+        workspace: str,
+        thread_id: str,
+        event: dict[str, Any],
+    ) -> str:
+        workspace_name = os.path.basename(workspace.rstrip(os.sep)) or workspace
+        thread_short = thread_id[:13] if thread_id else "pending"
+        if stage == "turn_started":
+            return (
+                "Codex is running\n"
+                f"Workspace: {workspace_name} · Session: {thread_short}"
+            )
+        if stage == "approval_requested":
+            return "Codex is waiting for command approval."
+        if stage == "tool_completed":
+            count = int(event.get("tool_iterations") or 0)
+            suffix = f" ({count} tool step{'s' if count != 1 else ''})" if count else ""
+            return f"Codex made progress{suffix}."
+        if stage == "waiting":
+            idle = int(float(event.get("idle_seconds") or 0))
+            return f"Codex is still running. Last app-server activity was {idle}s ago."
+        if stage == "turn_timed_out":
+            timeout = int(float(event.get("timeout_seconds") or 0))
+            return f"Codex task timed out after {timeout}s without app-server activity."
+        return ""
 
     def _session_record(self, task_key: str, thread_id: str) -> Any:
         try:

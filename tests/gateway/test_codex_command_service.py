@@ -94,6 +94,15 @@ class CountingCodexSession(FakeCodexSession):
         CountingCodexSession.instances.append(self)
 
 
+class ProgressCodexSession(FakeCodexSession):
+    def run_turn(self, user_input, **options):
+        callback = options.get("progress_callback")
+        if callback is not None:
+            callback({"stage": "turn_started"})
+            callback({"stage": "tool_completed", "tool_iterations": 1})
+        return super().run_turn(user_input, **options)
+
+
 class MemoryRegistry:
     def __init__(self):
         self.records = {}
@@ -684,6 +693,30 @@ async def test_codex_turn_timeouts_are_passed_to_app_server(
             "notification_poll_timeout": 0.5,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_codex_progress_notify_reports_turn_activity(
+    tmp_path, monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch, session_factory=ProgressCodexSession)
+    progress = []
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="new inspect",
+            workspace="/repo",
+            progress_notify=lambda data: progress.append(data),
+        )
+    )
+
+    assert result.status == "completed"
+    assert progress
+    assert progress[0]["type"] == "codex_progress"
+    assert progress[0]["stage"] == "turn_started"
+    assert "Codex is running" in progress[0]["text"]
 
 
 @pytest.mark.asyncio
