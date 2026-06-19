@@ -7,7 +7,9 @@ from gateway.control_planes.codex import (
     CommandRequest,
     build_codex_task_key,
 )
-from gateway.control_planes.codex.event_store import CodexRuntimeEventStore
+from gateway.control_planes.codex.event_store import CodexRuntimeEvent, CodexRuntimeEventStore
+from gateway.control_planes.codex.formatting import format_failure
+from gateway.control_planes.codex.narrator import CodexFieldNarrator
 
 
 class FakeCodexSession:
@@ -915,6 +917,42 @@ async def test_codex_runtime_events_are_persisted_and_queryable(
     assert events_result.status == "ok"
     assert "Codex 事件" in events_result.text
     assert "codex.notification" in events_result.text
+
+
+def test_codex_failure_format_localizes_post_tool_silence() -> None:
+    text = format_failure(
+        "Codex app-server failed",
+        "codex went silent for 90s after a tool result; retiring app-server session.",
+    )
+
+    assert "Codex app-server 在工具步骤后 90 秒没有新事件" in text
+    assert "went silent" not in text
+
+
+def test_codex_narrator_localizes_failed_turn_evidence() -> None:
+    event = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="turn.failed",
+        payload={
+            "error": "codex went silent for 90s after a tool result; retiring app-server session.",
+        },
+        occurred_at=0.0,
+    )
+
+    narration = CodexFieldNarrator().narrate(event, workspace="/repo", thread_id="thread")
+
+    assert narration is not None
+    rendered = narration.render()
+    assert "app-server 断流" in rendered
+    assert "没有新事件" in rendered
+    assert "went silent" not in rendered
+    assert "收口" not in rendered
 
 
 @pytest.mark.asyncio

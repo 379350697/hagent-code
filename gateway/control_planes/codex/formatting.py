@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -89,8 +90,15 @@ def _localize_message(message: str) -> str:
         "unknown error": "未知错误",
         "turn timed out": "本轮超时",
         "without app-server activity": "没有收到 app-server 活动",
+        "codex app-server subprocess exited unexpectedly": "Codex app-server 子进程意外退出",
     }
     text = message
+    text = re.sub(
+        r"codex went silent for ([0-9.]+)s after a tool result; retiring app-server session\.",
+        r"Codex app-server 在工具步骤后 \1 秒没有新事件；已回收本轮运行时。",
+        text,
+        flags=re.IGNORECASE,
+    )
     for source, target in replacements.items():
         text = text.replace(source, target)
     return text

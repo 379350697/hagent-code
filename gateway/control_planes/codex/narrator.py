@@ -74,9 +74,9 @@ class CodexFieldNarrator:
                 dedupe_key="turn_timed_out",
             )
         if event_type == "turn.failed":
-            error = _one_line(str(payload.get("error") or "未知错误"), 160)
+            error = _one_line(_localize_runtime_error(str(payload.get("error") or "未知错误")), 160)
             return CodexNarration(
-                "这轮失败了，我把错误收口到当前会话记录里了。",
+                "这轮 app-server 断流了，我已中断本轮，下一轮会从干净状态继续。",
                 importance="critical",
                 evidence=[error] if error else [],
                 dedupe_key="turn_failed",
@@ -256,6 +256,20 @@ def _one_line(text: str, limit: int) -> str:
     value = " ".join(str(text or "").split())
     if len(value) > limit:
         return value[: limit - 3] + "..."
+    return value
+
+
+def _localize_runtime_error(text: str) -> str:
+    value = re.sub(
+        r"codex went silent for ([0-9.]+)s after a tool result; retiring app-server session\.",
+        r"Codex app-server 在工具步骤后 \1 秒没有新事件；已回收本轮运行时。",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    value = value.replace(
+        "codex app-server subprocess exited unexpectedly",
+        "Codex app-server 子进程意外退出",
+    )
     return value
 
 
