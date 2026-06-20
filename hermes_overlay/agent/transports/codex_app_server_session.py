@@ -548,10 +548,17 @@ class CodexAppServerSession:
                         break
                     self._issue_interrupt(result.turn_id)
                     result.interrupted = True
+                    diagnostic = _recover_native_recent_diagnostic(
+                        self._thread_id or result.thread_id or "",
+                        codex_home=self._codex_home,
+                        since_epoch=turn_started_wall_at,
+                    )
                     result.error = (
                         f"Codex 命令运行超过 {active_tool_timeout:.0f} 秒仍未完成："
                         f"{oldest_label}"
                     )
+                    if diagnostic:
+                        result.error += f"\n原生 Codex 最近活动：{diagnostic}"
                     result.should_retire = True
                     break
             elif (now - last_activity_at) > turn_timeout:
@@ -597,11 +604,18 @@ class CodexAppServerSession:
                     break
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
+                diagnostic = _recover_native_recent_diagnostic(
+                    self._thread_id or result.thread_id or "",
+                    codex_home=self._codex_home,
+                    since_epoch=turn_started_wall_at,
+                )
                 result.error = (
                     f"Codex app-server 在工具步骤后 "
                     f"{post_tool_quiet_timeout:.0f} 秒没有新事件；"
                     f"已回收本轮运行时。"
                 )
+                if diagnostic:
+                    result.error += f"\n原生 Codex 最近活动：{diagnostic}"
                 result.should_retire = True
                 break
 
@@ -680,6 +694,7 @@ class CodexAppServerSession:
                             "waiting",
                             idle_seconds=max(0.0, now - last_activity_at),
                             timeout_seconds=turn_timeout,
+                            **_active_tool_progress_payload(active_tools, now),
                         )
                 continue
 
@@ -1090,6 +1105,19 @@ def _track_active_tool_notification(
         active_tools.pop(item_id, None)
 
 
+def _active_tool_progress_payload(
+    active_tools: dict[str, tuple[float, str]],
+    now: float,
+) -> dict[str, Any]:
+    if not active_tools:
+        return {}
+    started_at, label = min(active_tools.values(), key=lambda item: item[0])
+    return {
+        "active_tool_label": label,
+        "active_tool_elapsed_seconds": max(0.0, now - started_at),
+    }
+
+
 def _tool_label(item: dict[str, Any]) -> str:
     command = str(item.get("command") or "")
     if command:
@@ -1154,6 +1182,114 @@ def _recover_native_task_complete(
         except OSError:
             logger.debug("failed to read codex native session %s", path, exc_info=True)
     return redact_sensitive_text(best_text.strip(), force=True) if best_text else ""
+
+
+def _recover_native_recent_diagnostic(
+    thread_id: str,
+    *,
+    codex_home: Optional[str],
+    since_epoch: float,
+) -> str:
+    """Return the newest useful native Codex activity after this turn began.
+
+    This is deliberately diagnostic-only: unlike `task_complete` recovery it
+    never changes the turn status. It gives remote users a concrete last
+    native event when the app-server observer goes quiet.
+    """
+    if not thread_id:
+        return ""
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    pattern = os.path.join(home, "sessions", "**", f"*{thread_id}.jsonl")
+    best_text = ""
+    best_timestamp = 0.0
+    best_order = -1
+    order = 0
+    for path in sorted(glob.glob(pattern, recursive=True)):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    order += 1
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    timestamp = _parse_jsonl_timestamp(record.get("timestamp"))
+                    if timestamp and timestamp < since_epoch - 5.0:
+                        continue
+                    text = _native_diagnostic_text(record)
+                    if not text:
+                        continue
+                    if timestamp > best_timestamp or (
+                        timestamp == best_timestamp and order >= best_order
+                    ):
+                        best_timestamp = timestamp
+                        best_order = order
+                        best_text = text
+        except OSError:
+            logger.debug("failed to read codex native session %s", path, exc_info=True)
+    if not best_text:
+        return ""
+    return redact_sensitive_text(_compact_diagnostic(best_text), force=True)
+
+
+def _native_diagnostic_text(record: dict[str, Any]) -> str:
+    if not isinstance(record, dict):
+        return ""
+    record_type = record.get("type")
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    if record_type == "response_item":
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else payload
+        item_type = str(item.get("type") or "")
+        if item_type == "function_call_output":
+            output = item.get("output")
+            return _native_output_diagnostic(output)
+        if item_type in {"function_call", "local_shell_call"}:
+            name = str(item.get("name") or item.get("call_type") or item_type)
+            args = item.get("arguments") or item.get("input") or ""
+            preview = _compact_diagnostic(str(args), limit=180) if args else ""
+            return f"原生工具调用 {name}: {preview}" if preview else f"原生工具调用 {name}"
+    if record_type == "event_msg":
+        event_type = str(payload.get("type") or "")
+        if event_type == "turn_aborted":
+            return "原生 turn_aborted"
+        if event_type in {"error", "exec_error", "task_failed"}:
+            message = payload.get("message") or payload.get("error") or payload
+            return f"原生事件 {event_type}: {message}"
+    return ""
+
+
+def _native_output_diagnostic(output: Any) -> str:
+    if output is None:
+        return ""
+    text = str(output)
+    lines = [_compact_diagnostic(line, limit=240) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    error_markers = (
+        "traceback",
+        "error",
+        "failed",
+        "exception",
+        "syntaxerror",
+        "permission denied",
+        "operation not permitted",
+        "timed out",
+        "command not found",
+        "bwrap",
+    )
+    for line in reversed(lines):
+        lowered = line.lower()
+        if any(marker in lowered for marker in error_markers):
+            return f"原生工具输出：{line}"
+    return f"原生工具输出：{lines[-1]}"
+
+
+def _compact_diagnostic(text: str, *, limit: int = 320) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) > limit:
+        return value[: limit - 3] + "..."
+    return value
 
 
 def _native_task_complete_text(record: dict[str, Any]) -> str:

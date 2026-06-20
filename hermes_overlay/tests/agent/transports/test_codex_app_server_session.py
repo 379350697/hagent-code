@@ -925,6 +925,51 @@ class TestSessionRetirement:
         assert r.should_retire is True
         assert any(req for req in client.requests if req[0] == "turn/interrupt")
 
+    def test_post_tool_watchdog_includes_native_tool_output_diagnostic(
+        self, tmp_path,
+    ):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "find src -type f | sort", "cwd": "/repo",
+                "status": "completed", "aggregatedOutput": "",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="thread-fake-001", turnId="turn-fake-001",
+        )
+        codex_home = tmp_path / "codex"
+        session_dir = codex_home / "sessions" / "2999" / "01" / "01"
+        session_dir.mkdir(parents=True)
+        native_record = {
+            "timestamp": "2999-01-01T00:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+            },
+        }
+        (
+            session_dir / "rollout-2999-01-01T00-00-00-thread-fake-001.jsonl"
+        ).write_text(json.dumps(native_record) + "\n", encoding="utf-8")
+
+        s = make_session(client, codex_home=str(codex_home))
+        r = s.run_turn(
+            "tool then app-server loses completion",
+            turn_timeout=5.0,
+            notification_poll_timeout=0.02,
+            post_tool_quiet_timeout=0.15,
+        )
+
+        assert r.final_text == ""
+        assert r.error and "没有新事件" in r.error
+        assert "原生 Codex 最近活动" in r.error
+        assert "bwrap: loopback" in r.error
+        assert r.interrupted is True
+        assert r.should_retire is True
+
     def test_active_command_has_own_timeout_not_app_server_silence(self):
         client = FakeClient()
         client.queue_notification(
@@ -950,6 +995,77 @@ class TestSessionRetirement:
         assert r.error and "命令运行超过 0 秒仍未完成" in r.error
         assert "sleep 999" in r.error
         assert "app-server 在工具步骤后" not in r.error
+
+    def test_active_command_timeout_includes_native_tool_output_diagnostic(
+        self, tmp_path,
+    ):
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "python3", "cwd": "/repo",
+                "status": "inProgress",
+            },
+            threadId="thread-fake-001", turnId="turn-fake-001",
+        )
+        codex_home = tmp_path / "codex"
+        session_dir = codex_home / "sessions" / "2999" / "01" / "01"
+        session_dir.mkdir(parents=True)
+        native_record = {
+            "timestamp": "2999-01-01T00:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "/bin/bash: line 1: '#open-title': command not found",
+            },
+        }
+        (
+            session_dir / "rollout-2999-01-01T00-00-00-thread-fake-001.jsonl"
+        ).write_text(json.dumps(native_record) + "\n", encoding="utf-8")
+
+        s = make_session(client, codex_home=str(codex_home))
+        r = s.run_turn(
+            "long interactive command",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+            active_tool_timeout=0.03,
+        )
+
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "python3" in r.error
+        assert "原生 Codex 最近活动" in r.error
+        assert "command not found" in r.error
+
+    def test_waiting_progress_reports_active_tool_label(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "sleep 999", "cwd": "/tmp",
+                "status": "inProgress",
+            },
+            threadId="t", turnId="tu1",
+        )
+        progress = []
+        s = make_session(client)
+        r = s.run_turn(
+            "long command",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+            active_tool_timeout=0.03,
+            progress_interval=0.001,
+            progress_callback=lambda data: progress.append(data),
+        )
+
+        assert r.interrupted is True
+        waiting = [item for item in progress if item.get("stage") == "waiting"]
+        assert waiting
+        assert waiting[-1]["active_tool_label"] == "sleep 999"
+        assert waiting[-1]["active_tool_elapsed_seconds"] >= 0
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):
         client = FakeClient()

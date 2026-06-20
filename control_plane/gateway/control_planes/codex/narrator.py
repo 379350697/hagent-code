@@ -47,8 +47,19 @@ class CodexFieldNarrator:
         workspace_name = _workspace_name(workspace or str(payload.get("cwd") or ""))
         short_thread = (thread_id or event.thread_id)[:13] or "pending"
 
-        if event_type in {"progress.session_ready", "progress.waiting", "usage.updated"}:
+        if event_type in {"progress.session_ready", "usage.updated"}:
             return None
+        if event_type == "progress.waiting":
+            active_tool = _one_line(str(payload.get("active_tool_label") or ""), 120)
+            if not active_tool:
+                return None
+            elapsed = _duration(_float_or_zero(payload.get("active_tool_elapsed_seconds")))
+            idle = _duration(_float_or_zero(payload.get("idle_seconds")))
+            return CodexNarration(
+                "当前命令还没返回；我会持续看 app-server 和原生日志，避免远程端误判为卡死。",
+                evidence=[f"运行 {elapsed}，无新 app-server 事件 {idle}：{active_tool}"],
+                dedupe_key=f"active_tool_waiting:{_command_key(active_tool)}",
+            )
         if event_type == "progress.turn_started":
             return CodexNarration(
                 "我开始接这轮任务了，会只在关键节点同步进展。",
@@ -106,6 +117,12 @@ class CodexFieldNarrator:
             return None
         if method == "item/started" and item_type == "commandExecution":
             command = _command_preview(item)
+            if _looks_like_interactive_command(item):
+                return CodexNarration(
+                    "我进入了一个交互式命令会话；后面会继续用心跳说明它是否还活着。",
+                    evidence=[command] if command else [],
+                    dedupe_key=f"interactive_command_started:{_command_key(command)}",
+                )
             return CodexNarration(
                 "我正在跑命令验证现场，不是空等。",
                 evidence=[command] if command else [],
@@ -114,6 +131,12 @@ class CodexFieldNarrator:
         if method == "item/completed" and item_type == "commandExecution":
             command = _command_preview(item)
             output = str(item.get("aggregatedOutput") or "")
+            if _looks_like_interactive_command(item):
+                return CodexNarration(
+                    "交互式命令会话已经退出，我会继续接后续验证。",
+                    evidence=[command] if command else [],
+                    dedupe_key=f"interactive_command_completed:{_command_key(command)}",
+                )
             if _looks_like_test_command(command) or _looks_like_test_output(output):
                 return CodexNarration(
                     "刚跑完一轮测试，核心链路有结果了。",
@@ -215,10 +238,46 @@ def _approval_command(payload: dict[str, Any]) -> str:
 def _command_preview(item: dict[str, Any]) -> str:
     command = str(item.get("command") or "")
     cwd = str(item.get("cwd") or "")
-    preview = _one_line(command, 140)
+    preview = _interactive_command_preview(command) or _one_line(command, 140)
     if cwd:
         return f"{preview} @ {_workspace_name(cwd)}" if preview else f"工作区 {_workspace_name(cwd)}"
     return preview
+
+
+def _looks_like_interactive_command(item: dict[str, Any]) -> bool:
+    command = str(item.get("command") or "")
+    return bool(_interactive_command_preview(command))
+
+
+def _interactive_command_preview(command: str) -> str:
+    normalized = _shell_inner_command(command)
+    if not normalized:
+        return ""
+    tokens = normalized.split()
+    if not tokens:
+        return ""
+    executable = os.path.basename(tokens[0])
+    no_args = len(tokens) == 1
+    python_interactive = executable in {"python", "python3"} and (
+        no_args or tokens[1:] == ["-i"]
+    )
+    if python_interactive:
+        return f"交互式 Python 会话 ({_one_line(command, 100)})"
+    shell_interactive = executable in {"bash", "sh", "zsh", "fish"} and no_args
+    if shell_interactive:
+        return f"交互式 Shell 会话 ({_one_line(command, 100)})"
+    repl_interactive = executable in {"node", "irb", "pry", "iex", "ghci", "sqlite3", "psql"} and no_args
+    if repl_interactive:
+        return f"交互式命令会话 ({_one_line(command, 100)})"
+    return ""
+
+
+def _shell_inner_command(command: str) -> str:
+    value = " ".join(str(command or "").split())
+    for shell in ("/bin/bash -lc ", "bash -lc ", "/bin/sh -lc ", "sh -lc "):
+        if value.startswith(shell):
+            return value[len(shell) :].strip().strip("\"'")
+    return value
 
 
 def _command_key(command: str) -> str:
@@ -265,6 +324,13 @@ def _one_line(text: str, limit: int) -> str:
     if len(value) > limit:
         return value[: limit - 3] + "..."
     return value
+
+
+def _float_or_zero(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _localize_runtime_error(text: str) -> str:

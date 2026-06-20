@@ -1180,6 +1180,98 @@ def test_codex_narrator_keeps_observer_timeout_unconfirmed() -> None:
     assert "判失败" in rendered
 
 
+def test_codex_narrator_marks_interactive_python_command() -> None:
+    event = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="codex.notification",
+        payload={
+            "stage": "notification",
+            "method": "item/started",
+            "notification": {
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "ex1",
+                        "command": "/bin/bash -lc python3",
+                        "cwd": "/home/wl/projects/Lightld",
+                    }
+                },
+            },
+        },
+        occurred_at=0.0,
+    )
+
+    narration = CodexFieldNarrator().narrate(event, workspace="/repo", thread_id="thread")
+
+    assert narration is not None
+    rendered = narration.render()
+    assert "交互式命令会话" in rendered
+    assert "交互式 Python 会话" in rendered
+    assert "跑命令验证现场" not in rendered
+
+
+def test_codex_narrator_reports_active_tool_waiting() -> None:
+    event = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.waiting",
+        payload={
+            "stage": "waiting",
+            "idle_seconds": 91,
+            "active_tool_label": "/bin/bash -lc python3",
+            "active_tool_elapsed_seconds": 180,
+        },
+        occurred_at=0.0,
+    )
+
+    narration = CodexFieldNarrator().narrate(event, workspace="/repo", thread_id="thread")
+
+    assert narration is not None
+    rendered = narration.render()
+    assert "当前命令还没返回" in rendered
+    assert "无新 app-server 事件 1 分钟" in rendered
+    assert "/bin/bash -lc python3" in rendered
+
+
+def test_codex_narrator_tolerates_dirty_waiting_durations() -> None:
+    event = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.waiting",
+        payload={
+            "stage": "waiting",
+            "idle_seconds": "not-a-number",
+            "active_tool_label": "python3",
+            "active_tool_elapsed_seconds": None,
+        },
+        occurred_at=0.0,
+    )
+
+    narration = CodexFieldNarrator().narrate(event, workspace="/repo", thread_id="thread")
+
+    assert narration is not None
+    rendered = narration.render()
+    assert "运行 0 秒" in rendered
+    assert "无新 app-server 事件 0 秒" in rendered
+
+
 @pytest.mark.asyncio
 async def test_codex_runtime_event_payload_is_redacted(
     tmp_path, monkeypatch,
