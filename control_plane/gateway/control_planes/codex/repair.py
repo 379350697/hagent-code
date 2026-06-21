@@ -84,6 +84,7 @@ def latest_native_task_complete(
     *,
     codex_home: str = "",
     expected_turn_id: str = "",
+    since_epoch: float = 0.0,
 ) -> tuple[str, str] | None:
     if not thread_id:
         return None
@@ -111,6 +112,10 @@ def latest_native_task_complete(
                     if not message:
                         continue
                     timestamp = _parse_timestamp(record.get("timestamp"))
+                    if since_epoch and (
+                        not timestamp or timestamp < since_epoch - 5.0
+                    ):
+                        continue
                     if timestamp >= best_time:
                         best_time = timestamp
                         best = (turn_id, message)

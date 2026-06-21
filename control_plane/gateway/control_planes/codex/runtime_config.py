@@ -141,7 +141,28 @@ def _positive_float(value: Any, default: float) -> float:
     return parsed
 
 
-def codex_app_server_turn_options(cfg: dict[str, Any] | None = None) -> dict[str, float]:
+def normalize_unbounded_command_policy(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "": "conditional_hard",
+        "default": "conditional_hard",
+        "conditional": "conditional_hard",
+        "conditional_hard": "conditional_hard",
+        "strict": "strict_hard",
+        "strict_hard": "strict_hard",
+        "hard": "strict_hard",
+        "warn": "warn_only",
+        "warn_only": "warn_only",
+        "warning": "warn_only",
+        "off": "off",
+        "disabled": "off",
+        "none": "off",
+    }
+    policy = aliases.get(raw, raw)
+    return policy if policy in {"conditional_hard", "strict_hard", "warn_only", "off"} else "conditional_hard"
+
+
+def codex_app_server_turn_options(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     """Timeouts for a single app-server turn.
 
     Long-running remote Codex tasks commonly exceed the transport default. Keep
@@ -162,11 +183,15 @@ def codex_app_server_turn_options(cfg: dict[str, Any] | None = None) -> dict[str
         "notification_poll_timeout_seconds",
         codex_cfg.get("notification_poll_timeout", 0.25),
     )
+    unbounded_command_policy = normalize_unbounded_command_policy(
+        codex_cfg.get("unbounded_command_policy", "conditional_hard")
+    )
     return {
         "turn_timeout": _positive_float(turn_timeout, 1800.0),
         "post_tool_quiet_timeout": _positive_float(post_tool_quiet_timeout, 90.0),
         "active_tool_timeout": _positive_float(active_tool_timeout, 3600.0),
         "notification_poll_timeout": _positive_float(notification_poll_timeout, 0.25),
+        "unbounded_command_policy": unbounded_command_policy,
     }
 
 

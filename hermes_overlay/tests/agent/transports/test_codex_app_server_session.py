@@ -19,7 +19,9 @@ from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
+    classify_unbounded_command,
     _coerce_turn_input_text,
+    normalize_unbounded_command_policy,
 )
 
 
@@ -128,6 +130,56 @@ class TestApprovalChoiceMapping:
     ])
     def test_mapping(self, choice, expected):
         assert _approval_choice_to_codex_decision(choice) == expected
+
+
+class TestUnboundedCommandClassification:
+    @pytest.mark.parametrize(
+        "command,kind",
+        [
+            ("journalctl -f -u lightld.service", "journalctl_follow"),
+            ("journalctl --follow=cat -u lightld.service", "journalctl_follow"),
+            ("tail -f /tmp/app.log", "tail_follow"),
+            ("tail -F /tmp/app.log", "tail_follow"),
+            ("watch systemctl status lightld.service", "watch"),
+            ("top", "top"),
+            ("htop", "htop"),
+            ("less +F /tmp/app.log", "less_follow"),
+            ("ping example.com", "ping"),
+            ("/bin/bash -lc \"journalctl --user -u lightld.service -f --no-pager\"", "journalctl_follow"),
+        ],
+    )
+    def test_matches_unbounded_commands(self, command, kind):
+        match = classify_unbounded_command(command)
+
+        assert match is not None
+        assert match.kind == kind
+        assert match.recommendation
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "journalctl --user -u lightld.service -n 120 --no-pager",
+            "tail -n 120 /tmp/app.log",
+            "ping -c 3 example.com",
+            "top -b -n 1",
+            "ps -ef",
+        ],
+    )
+    def test_allows_bounded_commands(self, command):
+        assert classify_unbounded_command(command) is None
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("", "conditional_hard"),
+            ("strict", "strict_hard"),
+            ("warn", "warn_only"),
+            ("off", "off"),
+            ("surprise", "conditional_hard"),
+        ],
+    )
+    def test_policy_normalization(self, value, expected):
+        assert normalize_unbounded_command_policy(value) == expected
 
 
 class TestTurnInputCoercion:
@@ -650,6 +702,135 @@ class TestServerRequestRouting:
             auto_approve_exec=True))
         s.run_turn("hi", turn_timeout=1.0)
         assert ("r1", {"decision": "accept"}) in client.responses
+
+    @pytest.mark.parametrize("policy", ["conditional_hard", "strict_hard"])
+    def test_unbounded_exec_request_is_blocked_before_callback(self, policy):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="r1",
+            command="journalctl -f -u lightld.service",
+            cwd="/",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        called = False
+        progress: list[dict] = []
+
+        def cb(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            return "once"
+
+        s = make_session(client, approval_callback=cb)
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            unbounded_command_policy=policy,
+            progress_callback=lambda event: progress.append(event),
+        )
+
+        assert ("r1", {"decision": "decline"}) in client.responses
+        assert called is False
+        assert r.error and "无界命令" in r.error
+        assert any(
+            item.get("stage") == "unbounded_command_detected"
+            and item.get("blocked") is True
+            for item in progress
+        )
+
+    def test_unbounded_exec_request_warn_only_does_not_block(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="r1",
+            command="tail -f /tmp/app.log",
+            cwd="/",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        progress: list[dict] = []
+
+        s = make_session(client, approval_callback=lambda *_args, **_kwargs: "once")
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            unbounded_command_policy="warn_only",
+            progress_callback=lambda event: progress.append(event),
+        )
+
+        assert ("r1", {"decision": "accept"}) in client.responses
+        assert r.error is None
+        assert any(
+            item.get("stage") == "unbounded_command_detected"
+            and item.get("blocked") is False
+            for item in progress
+        )
+
+    def test_unbounded_exec_request_off_does_not_warn_or_block(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="r1",
+            command="ping example.com",
+            cwd="/",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        progress: list[dict] = []
+
+        s = make_session(client, approval_callback=lambda *_args, **_kwargs: "once")
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            unbounded_command_policy="off",
+            progress_callback=lambda event: progress.append(event),
+        )
+
+        assert ("r1", {"decision": "accept"}) in client.responses
+        assert r.error is None
+        assert not any(
+            item.get("stage") == "unbounded_command_detected"
+            for item in progress
+        )
+
+    def test_unbounded_auto_approved_started_command_is_interrupted(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "commandExecution",
+                "id": "ex1",
+                "command": "/bin/bash -lc \"journalctl -f -u lightld.service\"",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        progress: list[dict] = []
+
+        s = make_session(client)
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+            progress_callback=lambda event: progress.append(event),
+        )
+
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "无界命令" in r.error
+        assert any(method == "turn/interrupt" for method, _params in client.requests)
+        assert any(
+            item.get("stage") == "unbounded_command_detected"
+            and item.get("source") == "command_started"
+            for item in progress
+        )
 
     def test_callback_raises_falls_back_to_decline(self):
         client = FakeClient()

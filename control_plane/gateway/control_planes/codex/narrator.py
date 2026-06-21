@@ -50,6 +50,15 @@ class CodexFieldNarrator:
         if event_type in {"progress.session_ready", "usage.updated"}:
             return None
         if event_type == "progress.waiting":
+            native_status = str(payload.get("native_reconcile_status") or "")
+            native_reason = _one_line(str(payload.get("native_reconcile_reason") or ""), 160)
+            if native_status == "completed":
+                return CodexNarration(
+                    "native 侧已完成，本地状态会按最终结果恢复。",
+                    importance="high",
+                    evidence=[native_reason] if native_reason else [],
+                    dedupe_key="native_reconcile_completed",
+                )
             active_tool = _one_line(str(payload.get("active_tool_label") or ""), 120)
             if not active_tool:
                 return None
@@ -59,6 +68,42 @@ class CodexFieldNarrator:
                 "当前命令还没返回；我会持续看 app-server 和原生日志，避免远程端误判为卡死。",
                 evidence=[f"运行 {elapsed}，无新 app-server 事件 {idle}：{active_tool}"],
                 dedupe_key=f"active_tool_waiting:{_command_key(active_tool)}",
+            )
+        if event_type == "progress.unbounded_command_detected":
+            command = _one_line(str(payload.get("command") or ""), 140)
+            reason = _one_line(str(payload.get("reason") or ""), 160)
+            recommendation = _one_line(str(payload.get("recommendation") or ""), 180)
+            blocked = bool(payload.get("blocked"))
+            return CodexNarration(
+                "命令被 Hermes 护栏拦截；我不会让这类无界命令继续占住远程任务。"
+                if blocked
+                else "检测到无界命令风险；当前策略只记录警告，不阻断执行。",
+                importance="critical" if blocked else "high",
+                evidence=[item for item in (command, reason, recommendation) if item],
+                dedupe_key=f"unbounded_command:{_command_key(command)}",
+            )
+        if event_type == "progress.turn_completion_recovered":
+            return CodexNarration(
+                "native 侧已完成，本地状态已恢复。",
+                importance="high",
+                evidence=["Codex 原生 task_complete 已确认"],
+                dedupe_key="turn_completion_recovered",
+            )
+        if event_type == "progress.native_reconciled":
+            reason = _one_line(str(payload.get("native_reconcile_reason") or ""), 160)
+            return CodexNarration(
+                "native 侧已完成，本地状态已恢复。",
+                importance="high",
+                evidence=[reason] if reason else ["Codex 原生状态已对账"],
+                dedupe_key="native_reconciled",
+            )
+        if event_type == "task.recoverable_stale":
+            reason = _one_line(str(payload.get("native_reconcile_reason") or ""), 160)
+            return CodexNarration(
+                "状态不可确认，已进入恢复/超时路径；我不会直接替 Codex 判失败。",
+                importance="critical",
+                evidence=[reason] if reason else [],
+                dedupe_key="recoverable_stale",
             )
         if event_type == "progress.turn_started":
             return CodexNarration(
@@ -184,6 +229,27 @@ class CodexFieldNarrator:
         workspace: str = "",
         thread_id: str = "",
     ) -> str:
+        terminal_priority = {
+            "turn.completed",
+            "progress.turn_completed",
+            "progress.turn_completion_recovered",
+            "progress.native_reconciled",
+            "turn.failed",
+            "turn.unconfirmed",
+            "task.recoverable_stale",
+        }
+        for event in reversed(events):
+            if event.event_type not in terminal_priority:
+                continue
+            narration = self.narrate(
+                event,
+                recent_events=events,
+                workspace=workspace,
+                thread_id=thread_id,
+            )
+            if narration is not None:
+                age = _duration(time.time() - event.occurred_at)
+                return f"{narration.render()}\n最后活动：{age}前"
         for event in reversed(events):
             narration = self.narrate(
                 event,

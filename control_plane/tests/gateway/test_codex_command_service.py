@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import json
+import time
 
 import pytest
 
@@ -999,6 +1000,111 @@ async def test_codex_repair_recovered_preview_and_apply(
 
 
 @pytest.mark.asyncio
+async def test_codex_status_reconciles_running_record_from_native_completion(
+    tmp_path, monkeypatch,
+) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+
+    codex_home = tmp_path / "codex"
+    session_dir = codex_home / "sessions" / "2999" / "01" / "01"
+    session_dir.mkdir(parents=True)
+    native_record = {
+        "timestamp": "2999-01-01T00:00:00Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "turn_id": "turn-native",
+            "last_agent_message": "native says done",
+        },
+    }
+    (session_dir / "rollout-2999-thread-running.jsonl").write_text(
+        json.dumps(native_record) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    registry = MemoryRegistry()
+    registry.upsert(
+        make_task_record(
+            task_id="running123",
+            task_key="discord:42:main",
+            status="running",
+            workspace="/repo",
+            thread_id="thread-running",
+            turn_id="turn-native",
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="original",
+            last_message="Codex: turn started",
+        )
+    )
+    event_store = CodexRuntimeEventStore(str(tmp_path / "events.sqlite3"))
+    service = _service(tmp_path, monkeypatch, registry=registry, event_store=event_store)
+
+    status = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="status")
+    )
+
+    assert status.status == "completed"
+    assert "最近一轮：已完成" in status.text
+    assert "native 侧已完成" in status.text
+    assert registry.records["running123"].status == "completed"
+    assert any(
+        event.event_type == "progress.native_reconciled"
+        for event in event_store.tail(task_id="running123", limit=10)
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_status_marks_old_running_record_recoverable_stale(
+    tmp_path, monkeypatch,
+) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+    from gateway.control_planes.codex import service as service_mod
+
+    registry = MemoryRegistry()
+    record = make_task_record(
+        task_id="stale123",
+        task_key="discord:42:main",
+        status="running",
+        workspace="/repo",
+        thread_id="thread-stale",
+        turn_id="turn-stale",
+        model="gpt-5.5",
+        approval="on-request",
+        sandbox="workspace-write",
+        plan_mode=False,
+        prompt="original",
+        last_message="Codex: turn started",
+    )
+    record.updated_at = time.time() - 60
+    registry.upsert(record)
+    record.updated_at = time.time() - 60
+    monkeypatch.setattr(
+        service_mod,
+        "load_codex_cfg",
+        lambda: {"stale_running_seconds": 1},
+    )
+    event_store = CodexRuntimeEventStore(str(tmp_path / "events.sqlite3"))
+    service = _service(tmp_path, monkeypatch, registry=registry, event_store=event_store)
+    monkeypatch.setattr(
+        service_mod,
+        "load_codex_cfg",
+        lambda: {"stale_running_seconds": 1},
+    )
+
+    status = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="status")
+    )
+
+    assert status.status == "recoverable_stale"
+    assert "最近一轮：待恢复" in status.text
+    assert "状态不可确认" in status.text
+    assert registry.records["stale123"].status == "recoverable_stale"
+
+
+@pytest.mark.asyncio
 async def test_codex_sandbox_config_is_passed_to_app_server(
     tmp_path, monkeypatch,
 ) -> None:
@@ -1053,7 +1159,31 @@ async def test_codex_turn_timeouts_are_passed_to_app_server(
     assert options["post_tool_quiet_timeout"] == 45.0
     assert options["active_tool_timeout"] == 7200.0
     assert options["notification_poll_timeout"] == 0.5
+    assert options["unbounded_command_policy"] == "conditional_hard"
     assert callable(options["progress_callback"])
+
+
+@pytest.mark.asyncio
+async def test_codex_unbounded_command_policy_is_passed_to_app_server(
+    tmp_path, monkeypatch,
+) -> None:
+    CountingCodexSession.instances = []
+    service = _service(tmp_path, monkeypatch, session_factory=CountingCodexSession)
+    from gateway.control_planes.codex import service as service_mod
+
+    monkeypatch.setattr(
+        service_mod,
+        "load_codex_cfg",
+        lambda: {"unbounded_command_policy": "strict_hard"},
+    )
+
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new inspect", workspace="/repo")
+    )
+
+    assert result.status == "completed"
+    options = CountingCodexSession.instances[0].run_turn_options[0]
+    assert options["unbounded_command_policy"] == "strict_hard"
 
 
 @pytest.mark.asyncio
@@ -1243,6 +1373,79 @@ def test_codex_narrator_reports_active_tool_waiting() -> None:
     assert "当前命令还没返回" in rendered
     assert "无新 app-server 事件 1 分钟" in rendered
     assert "/bin/bash -lc python3" in rendered
+
+
+def test_codex_narrator_reports_unbounded_command_guardrail() -> None:
+    event = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.unbounded_command_detected",
+        payload={
+            "stage": "unbounded_command_detected",
+            "command": "journalctl -f -u lightld.service",
+            "reason": "持续跟随日志",
+            "recommendation": "使用 -n 120 --no-pager",
+            "blocked": True,
+        },
+        occurred_at=0.0,
+    )
+
+    narration = CodexFieldNarrator().narrate(event, workspace="/repo", thread_id="thread")
+
+    assert narration is not None
+    rendered = narration.render()
+    assert "护栏拦截" in rendered
+    assert "journalctl -f" in rendered
+
+
+def test_codex_narrator_status_prioritizes_native_recovery_over_old_waiting() -> None:
+    waiting = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.waiting",
+        payload={
+            "stage": "waiting",
+            "idle_seconds": 90,
+            "active_tool_label": "journalctl -f",
+            "active_tool_elapsed_seconds": 120,
+        },
+        occurred_at=10.0,
+    )
+    recovered = CodexRuntimeEvent(
+        id=2,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.native_reconciled",
+        payload={
+            "stage": "native_reconciled",
+            "native_reconcile_status": "completed",
+            "native_reconcile_reason": "native task_complete confirmed",
+        },
+        occurred_at=5.0,
+    )
+
+    text = CodexFieldNarrator().status_text(
+        [recovered, waiting],
+        workspace="/repo",
+        thread_id="thread",
+    )
+
+    assert "native 侧已完成" in text
+    assert "当前命令还没返回" not in text
 
 
 def test_codex_narrator_tolerates_dirty_waiting_durations() -> None:

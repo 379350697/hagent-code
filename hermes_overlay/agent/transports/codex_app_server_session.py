@@ -28,6 +28,7 @@ import glob
 import json
 import logging
 import os
+import shlex
 import threading
 import time
 from dataclasses import dataclass, field
@@ -105,6 +106,28 @@ class TurnResult:
 # items when an interrupt or upstream error tears the turn down before the
 # normal completion path fires. Mirrors openclaw beta.8 fix.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
+
+_UNBOUNDED_COMMAND_POLICIES = {
+    "conditional_hard",
+    "strict_hard",
+    "warn_only",
+    "off",
+}
+
+
+@dataclass(frozen=True)
+class UnboundedCommandMatch:
+    command: str
+    kind: str
+    reason: str
+    recommendation: str
+
+    @property
+    def user_message(self) -> str:
+        return (
+            "Hermes 已拦截一个无界命令，避免远程任务长时间占住工具或被误判为卡死："
+            f"{self.command}\n原因：{self.reason}\n建议：{self.recommendation}"
+        )
 
 
 def _coerce_turn_input_text(user_input: Any) -> str:
@@ -425,6 +448,7 @@ class CodexAppServerSession:
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
         active_tool_timeout: float = 3600.0,
+        unbounded_command_policy: str = "conditional_hard",
         progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
         progress_interval: float = 60.0,
     ) -> TurnResult:
@@ -476,6 +500,9 @@ class CodexAppServerSession:
         self._interrupt_event.clear()
         self._last_approval_error = None
         projector = CodexEventProjector()
+        unbounded_policy = normalize_unbounded_command_policy(
+            unbounded_command_policy
+        )
 
         user_input_text = _coerce_turn_input_text(user_input)
 
@@ -638,12 +665,24 @@ class CodexAppServerSession:
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
                 # to avoid starving the server-request response.
+                server_request_blocked = False
                 for _ in range(8):
                     pending = self._client.take_notification(timeout=0)
                     if pending is None:
                         break
                     last_activity_at = time.monotonic()
                     _track_active_tool_notification(pending, active_tools)
+                    blocked = self._maybe_block_unbounded_started_command(
+                        pending,
+                        result,
+                        policy=unbounded_policy,
+                        progress_callback=emit_progress,
+                    )
+                    if blocked:
+                        active_tools.clear()
+                        turn_complete = True
+                        server_request_blocked = True
+                        break
                     if pending.get("method") == "turn/completed":
                         active_tools.clear()
                         turn_complete = True
@@ -676,7 +715,13 @@ class CodexAppServerSession:
                                 result.error
                                 or "codex reported turn_aborted"
                             )
-                self._handle_server_request(sreq)
+                if server_request_blocked:
+                    continue
+                self._handle_server_request(
+                    sreq,
+                    unbounded_command_policy=unbounded_policy,
+                    progress_callback=emit_progress,
+                )
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
                 last_tool_completion_at = None
@@ -690,10 +735,22 @@ class CodexAppServerSession:
                     now = time.monotonic()
                     if (now - last_progress_at) > progress_interval:
                         last_progress_at = now
+                        if self._recover_completed_turn(
+                            result,
+                            since_epoch=turn_started_wall_at,
+                            progress_callback=emit_progress,
+                        ):
+                            turn_complete = True
+                            break
                         emit_progress(
                             "waiting",
                             idle_seconds=max(0.0, now - last_activity_at),
                             timeout_seconds=turn_timeout,
+                            **_native_reconcile_progress_payload(
+                                self._thread_id or result.thread_id or "",
+                                codex_home=self._codex_home,
+                                since_epoch=turn_started_wall_at,
+                            ),
                             **_active_tool_progress_payload(active_tools, now),
                         )
                 continue
@@ -701,6 +758,15 @@ class CodexAppServerSession:
             last_activity_at = time.monotonic()
             method = note.get("method", "")
             _track_active_tool_notification(note, active_tools)
+            if self._maybe_block_unbounded_started_command(
+                note,
+                result,
+                policy=unbounded_policy,
+                progress_callback=emit_progress,
+            ):
+                active_tools.clear()
+                turn_complete = True
+                break
             if _is_meaningful_post_tool_activity(note):
                 last_tool_completion_at = None
             emit_progress(
@@ -859,7 +925,13 @@ class CodexAppServerSession:
         except TimeoutError:
             logger.warning("turn/interrupt timed out")
 
-    def _handle_server_request(self, req: dict) -> None:
+    def _handle_server_request(
+        self,
+        req: dict,
+        *,
+        unbounded_command_policy: str = "conditional_hard",
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> None:
         """Translate a codex server request (approval) into Hermes' approval
         flow, then send the response.
 
@@ -878,7 +950,11 @@ class CodexAppServerSession:
         params = req.get("params") or {}
 
         if method == "item/commandExecution/requestApproval":
-            decision = self._decide_exec_approval(params)
+            decision = self._decide_exec_approval(
+                params,
+                unbounded_command_policy=unbounded_command_policy,
+                progress_callback=progress_callback,
+            )
             self._client.respond(rid, {"decision": decision})
         elif method == "item/fileChange/requestApproval":
             decision = self._decide_apply_patch_approval(params)
@@ -917,10 +993,43 @@ class CodexAppServerSession:
                 rid, code=-32601, message=f"Unsupported method: {method}"
             )
 
-    def _decide_exec_approval(self, params: dict) -> str:
+    def _decide_exec_approval(
+        self,
+        params: dict,
+        *,
+        unbounded_command_policy: str = "conditional_hard",
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> str:
+        command = params.get("command") or ""
+        match = classify_unbounded_command(command)
+        if _should_hard_block_unbounded(match, unbounded_command_policy):
+            self._last_approval_error = match.user_message
+            if progress_callback is not None:
+                progress_callback(
+                    "unbounded_command_detected",
+                    command=match.command,
+                    reason=match.reason,
+                    recommendation=match.recommendation,
+                    unbounded_command_detected=True,
+                    unbounded_command_policy=unbounded_command_policy,
+                    blocked=True,
+                    source="approval_request",
+                )
+            return "decline"
+        if match is not None and unbounded_command_policy == "warn_only":
+            if progress_callback is not None:
+                progress_callback(
+                    "unbounded_command_detected",
+                    command=match.command,
+                    reason=match.reason,
+                    recommendation=match.recommendation,
+                    unbounded_command_detected=True,
+                    unbounded_command_policy=unbounded_command_policy,
+                    blocked=False,
+                    source="approval_request",
+                )
         if self._routing.auto_approve_exec:
             return "accept"
-        command = params.get("command") or ""
         # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
         # fall back to the session's cwd when codex doesn't include it so the
         # approval prompt is never empty (quirk #10 fix).
@@ -941,6 +1050,41 @@ class CodexAppServerSession:
                 return "decline"
         self._last_approval_error = "Codex 审批通道不可用"
         return "decline"  # fail-closed when no callback wired
+
+    def _maybe_block_unbounded_started_command(
+        self,
+        notification: dict[str, Any],
+        result: TurnResult,
+        *,
+        policy: str,
+        progress_callback: Callable[..., None],
+    ) -> bool:
+        item = _notification_item(notification)
+        if not item or item.get("type") != "commandExecution":
+            return False
+        if str((notification or {}).get("method") or "") != "item/started":
+            return False
+        match = classify_unbounded_command(str(item.get("command") or ""))
+        if match is None:
+            return False
+        hard_block = _should_hard_block_unbounded(match, policy)
+        progress_callback(
+            "unbounded_command_detected",
+            command=match.command,
+            reason=match.reason,
+            recommendation=match.recommendation,
+            unbounded_command_detected=True,
+            unbounded_command_policy=policy,
+            blocked=hard_block,
+            source="command_started",
+        )
+        if not hard_block:
+            return False
+        self._issue_interrupt(result.turn_id)
+        result.interrupted = True
+        result.error = match.user_message
+        result.should_retire = True
+        return True
 
     def _decide_apply_patch_approval(self, params: dict) -> str:
         if self._routing.auto_approve_apply_patch:
@@ -1105,6 +1249,13 @@ def _track_active_tool_notification(
         active_tools.pop(item_id, None)
 
 
+def _notification_item(notification: dict[str, Any]) -> dict[str, Any]:
+    params = notification.get("params") if isinstance(notification, dict) else {}
+    params = params if isinstance(params, dict) else {}
+    item = params.get("item")
+    return item if isinstance(item, dict) else {}
+
+
 def _active_tool_progress_payload(
     active_tools: dict[str, tuple[float, str]],
     now: float,
@@ -1124,6 +1275,161 @@ def _tool_label(item: dict[str, Any]) -> str:
         return redact_sensitive_text(" ".join(command.split()), force=True)[:160]
     name = str(item.get("name") or item.get("toolName") or item.get("type") or "工具步骤")
     return name[:160]
+
+
+def normalize_unbounded_command_policy(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "conditional": "conditional_hard",
+        "conditional_hard": "conditional_hard",
+        "default": "conditional_hard",
+        "strict": "strict_hard",
+        "strict_hard": "strict_hard",
+        "hard": "strict_hard",
+        "warn": "warn_only",
+        "warn_only": "warn_only",
+        "warning": "warn_only",
+        "off": "off",
+        "disabled": "off",
+        "none": "off",
+    }
+    policy = aliases.get(raw, raw)
+    return policy if policy in _UNBOUNDED_COMMAND_POLICIES else "conditional_hard"
+
+
+def classify_unbounded_command(command: Any) -> Optional[UnboundedCommandMatch]:
+    normalized = _normalize_command_text(command)
+    if not normalized:
+        return None
+    tokens = _command_tokens(normalized)
+    if not tokens:
+        return None
+    executable = os.path.basename(tokens[0])
+    args = tokens[1:]
+    if executable == "journalctl" and _has_flag(args, "-f", "--follow"):
+        return UnboundedCommandMatch(
+            command=redact_sensitive_text(normalized, force=True),
+            kind="journalctl_follow",
+            reason="`journalctl -f/--follow` 会持续跟随日志，远程任务可能长期不返回。",
+            recommendation=(
+                "改用 `journalctl --user -u <service> --since '<time>' "
+                "-n 120 --no-pager`，必要时短间隔重复 3-5 次并设置完成条件。"
+            ),
+        )
+    if executable == "tail" and _has_flag(args, "-f", "-F", "--follow"):
+        return UnboundedCommandMatch(
+            command=redact_sensitive_text(normalized, force=True),
+            kind="tail_follow",
+            reason="`tail -f/-F` 会持续占住命令步骤，远程端无法可靠收口。",
+            recommendation=(
+                "改用 `tail -n 120 <file>` 或按固定次数轮询文件尾部，"
+                "最后再做一次状态确认。"
+            ),
+        )
+    if executable == "watch":
+        return UnboundedCommandMatch(
+            command=redact_sensitive_text(normalized, force=True),
+            kind="watch",
+            reason="`watch` 默认无限刷新，会让 Codex 工具步骤保持运行。",
+            recommendation="改用有界循环，例如固定 3-5 次执行目标命令并在每次之间短暂 sleep。",
+        )
+    if executable in {"top", "htop"} and not _has_batch_or_count_limit(executable, args):
+        return UnboundedCommandMatch(
+            command=redact_sensitive_text(normalized, force=True),
+            kind=executable,
+            reason=f"`{executable}` 默认是交互式/持续刷新命令。",
+            recommendation="改用 `ps`、`pgrep`、`systemctl status` 或带批处理/次数限制的替代命令。",
+        )
+    if executable == "less" and any(arg == "+F" for arg in args):
+        return UnboundedCommandMatch(
+            command=redact_sensitive_text(normalized, force=True),
+            kind="less_follow",
+            reason="`less +F` 会进入持续跟随模式。",
+            recommendation="改用 `sed -n`、`tail -n` 或一次性读取需要的日志范围。",
+        )
+    if executable == "ping" and not _has_ping_count_limit(args):
+        return UnboundedCommandMatch(
+            command=redact_sensitive_text(normalized, force=True),
+            kind="ping",
+            reason="未带次数限制的 `ping` 会持续运行。",
+            recommendation="改用 `ping -c 3 <host>` 或带明确 deadline/count 的网络探测。",
+        )
+    return None
+
+
+def _should_hard_block_unbounded(
+    match: Optional[UnboundedCommandMatch],
+    policy: str,
+) -> bool:
+    if match is None:
+        return False
+    normalized = normalize_unbounded_command_policy(policy)
+    return normalized in {"conditional_hard", "strict_hard"}
+
+
+def _normalize_command_text(command: Any) -> str:
+    value = " ".join(str(command or "").split())
+    for _ in range(3):
+        tokens = _command_tokens(value)
+        if (
+            len(tokens) >= 3
+            and os.path.basename(tokens[0]) in {"bash", "sh", "zsh"}
+            and tokens[1] in {"-c", "-lc"}
+        ):
+            value = " ".join(str(tokens[2] or "").split())
+            continue
+        if (
+            len(tokens) >= 3
+            and tokens[0] == "/usr/bin/env"
+            and os.path.basename(tokens[1]) in {"bash", "sh", "zsh"}
+            and tokens[2] in {"-c", "-lc"}
+        ):
+            value = " ".join(str(tokens[3] if len(tokens) > 3 else "").split())
+            continue
+        break
+    return value
+
+
+def _command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return str(command or "").split()
+
+
+def _has_flag(args: list[str], *flags: str) -> bool:
+    wanted = set(flags)
+    for arg in args:
+        if arg in wanted:
+            return True
+        if arg.startswith("--"):
+            for flag in wanted:
+                if flag.startswith("--") and arg.startswith(f"{flag}="):
+                    return True
+        if arg.startswith("-") and not arg.startswith("--"):
+            for flag in wanted:
+                if len(flag) == 2 and flag[1] in arg[1:]:
+                    return True
+    return False
+
+
+def _has_ping_count_limit(args: list[str]) -> bool:
+    for index, arg in enumerate(args):
+        if arg in {"-c", "-w", "-W"} and index + 1 < len(args):
+            return True
+        if arg.startswith("-c") and len(arg) > 2:
+            return True
+        if arg.startswith("-w") and len(arg) > 2:
+            return True
+    return False
+
+
+def _has_batch_or_count_limit(executable: str, args: list[str]) -> bool:
+    if executable == "top":
+        return _has_flag(args, "-b") and any(
+            arg == "-n" or arg.startswith("-n") for arg in args
+        )
+    return False
 
 
 def _append_recovered_assistant_message(result: TurnResult, text: str) -> None:
@@ -1171,7 +1477,9 @@ def _recover_native_task_complete(
                     except json.JSONDecodeError:
                         continue
                     timestamp = _parse_jsonl_timestamp(record.get("timestamp"))
-                    if timestamp and timestamp < since_epoch - 5.0:
+                    if since_epoch and (
+                        not timestamp or timestamp < since_epoch - 5.0
+                    ):
                         continue
                     text = _native_task_complete_text(record)
                     if not text:
@@ -1230,6 +1538,28 @@ def _recover_native_recent_diagnostic(
     if not best_text:
         return ""
     return redact_sensitive_text(_compact_diagnostic(best_text), force=True)
+
+
+def _native_reconcile_progress_payload(
+    thread_id: str,
+    *,
+    codex_home: Optional[str],
+    since_epoch: float,
+) -> dict[str, Any]:
+    diagnostic = _recover_native_recent_diagnostic(
+        thread_id,
+        codex_home=codex_home,
+        since_epoch=since_epoch,
+    )
+    if diagnostic:
+        return {
+            "native_reconcile_status": "recent_activity",
+            "native_reconcile_reason": diagnostic,
+        }
+    return {
+        "native_reconcile_status": "unknown",
+        "native_reconcile_reason": "没有找到可确认完成的原生 Codex 事件",
+    }
 
 
 def _native_diagnostic_text(record: dict[str, Any]) -> str:

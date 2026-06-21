@@ -36,7 +36,11 @@ from .runtime_config import (
     normalize_sandbox_mode,
     read_codex_config_model,
 )
-from .repair import apply_recovered_turns, find_recoverable_completed_turns
+from .repair import (
+    apply_recovered_turns,
+    find_recoverable_completed_turns,
+    latest_native_task_complete,
+)
 from .selection import SelectedSessionStore
 from .session_pool import CodexSessionPool, LiveSession
 from .task_keys import build_codex_task_key, task_id_for
@@ -277,6 +281,7 @@ class CodexCommandService:
         record = self._selected_or_latest_record(task_key)
         if record is None:
             return CommandResult("还没有 Codex 任务记录。", status="not_found")
+        record = self._reconcile_status_record(record, task_key)
         text = format_task_status(
             record,
             verbose=self._can_show_all_sessions(request),
@@ -305,6 +310,79 @@ class CodexCommandService:
             task_id=str(getattr(record, "task_id", "") or ""),
             thread_id=str(getattr(record, "thread_id", "") or ""),
         )
+
+    def _reconcile_status_record(self, record: Any, task_key: str) -> Any:
+        status = str(getattr(record, "status", "") or "")
+        if status not in {"starting", "planning", "running", "busy", "recoverable_stale"}:
+            return record
+        task_id = str(getattr(record, "task_id", "") or "")
+        thread_id = str(getattr(record, "thread_id", "") or "")
+        if not task_id or not thread_id:
+            return record
+        turn_id = str(getattr(record, "turn_id", "") or "")
+        since_epoch = float(
+            getattr(record, "updated_at", None)
+            or getattr(record, "started_at", None)
+            or 0.0
+        )
+        complete = latest_native_task_complete(
+            thread_id,
+            expected_turn_id=turn_id,
+            since_epoch=since_epoch,
+        )
+        if complete is not None:
+            native_turn_id, message = complete
+            updated = self._registry.update(
+                task_id,
+                status="completed",
+                turn_id=native_turn_id or turn_id,
+                completed_at=time.time(),
+                last_message="Codex: turn completed",
+            )
+            self._append_runtime_event(
+                task_key=task_key,
+                task_id=task_id,
+                thread_id=thread_id,
+                turn_id=native_turn_id or turn_id,
+                event_type="progress.native_reconciled",
+                payload={
+                    "stage": "native_reconciled",
+                    "native_reconcile_status": "completed",
+                    "native_reconcile_reason": "native task_complete confirmed",
+                    "message_preview": " ".join(message.split())[:160],
+                },
+                workspace=str(getattr(record, "workspace", "") or ""),
+            )
+            return updated or record
+        live = self._sessions.peek(task_key)
+        if live is not None and live.lock.locked():
+            return record
+        stale_after = self._stale_running_seconds(load_codex_cfg())
+        updated_at = float(getattr(record, "updated_at", None) or 0.0)
+        if status != "recoverable_stale" and updated_at and (time.time() - updated_at) >= stale_after:
+            updated = self._registry.update(
+                task_id,
+                status="recoverable_stale",
+                last_message="Codex 状态不可确认，进入恢复/超时路径",
+            )
+            self._append_runtime_event(
+                task_key=task_key,
+                task_id=task_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                event_type="task.recoverable_stale",
+                payload={
+                    "stage": "recoverable_stale",
+                    "native_reconcile_status": "stale",
+                    "native_reconcile_reason": (
+                        "本地记录仍在运行，但当前进程没有活跃 Codex turn 可确认"
+                    ),
+                    "stale_after_seconds": stale_after,
+                },
+                workspace=str(getattr(record, "workspace", "") or ""),
+            )
+            return updated or record
+        return record
 
     async def _doctor(self, request: CommandRequest, task_key: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
@@ -675,6 +753,7 @@ class CodexCommandService:
             "failed": "失败",
             "interrupted": "已中断",
             "unconfirmed": "未确认",
+            "recoverable_stale": "待恢复",
             "busy": "忙碌",
             "not_found": "未找到",
             "unknown": "未知",
@@ -1059,11 +1138,17 @@ class CodexCommandService:
         def callback(event: dict[str, Any]) -> None:
             nonlocal last_emit_at
             event_type = event_type_from_progress(event)
+            turn_id_value = str(event.get("turn_id") or "")
+            if turn_id_value and event_type == "progress.turn_started":
+                try:
+                    self._registry.update(task_id, turn_id=turn_id_value)
+                except Exception:
+                    logger.debug("Codex turn_id registry update failed", exc_info=True)
             stored = self._append_runtime_event(
                 task_key=task_key,
                 task_id=task_id,
                 thread_id=thread_id,
-                turn_id=str(event.get("turn_id") or ""),
+                turn_id=turn_id_value,
                 platform=platform,
                 chat_id=chat_id,
                 event_type=event_type,
@@ -1178,6 +1263,19 @@ class CodexCommandService:
         except (TypeError, ValueError):
             return 60.0
         return value if value > 0 else 60.0
+
+    @staticmethod
+    def _stale_running_seconds(codex_cfg: dict[str, Any]) -> float:
+        try:
+            value = float(
+                codex_cfg.get(
+                    "stale_running_seconds",
+                    codex_cfg.get("stale_running_timeout_seconds", 900.0),
+                )
+            )
+        except (TypeError, ValueError):
+            return 900.0
+        return value if value > 0 else 900.0
 
     def _session_record(self, task_key: str, thread_id: str) -> Any:
         try:

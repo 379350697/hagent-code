@@ -126,6 +126,7 @@ def _status_label(status: str) -> str:
         "failed": "失败",
         "interrupted": "已中断",
         "unconfirmed": "未确认",
+        "recoverable_stale": "待恢复",
         "busy": "忙碌",
         "not_found": "未找到",
         "unknown": "未知",
