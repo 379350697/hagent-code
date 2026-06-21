@@ -1437,7 +1437,7 @@ def test_codex_failure_format_localizes_post_tool_silence() -> None:
         "codex went silent for 90s after a tool result; retiring app-server session.",
     )
 
-    assert "Codex app-server 在工具步骤后 90 秒没有新事件" in text
+    assert "Codex app-server 在上一次操作完成后 90 秒没有新事件" in text
     assert "went silent" not in text
 
 
@@ -1526,6 +1526,227 @@ def test_codex_narrator_marks_interactive_python_command() -> None:
     assert "交互式命令会话" in rendered
     assert "交互式 Python 会话" in rendered
     assert "跑命令验证现场" not in rendered
+
+
+def test_codex_narrator_reports_command_completion_without_tool_step_wording() -> None:
+    event = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="codex.notification",
+        payload={
+            "stage": "notification",
+            "method": "item/completed",
+            "notification": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "rg -n codex gateway",
+                        "cwd": "/repo",
+                    }
+                },
+            },
+        },
+        occurred_at=0.0,
+    )
+
+    narration = CodexFieldNarrator().narrate(event, workspace="/repo", thread_id="thread")
+
+    assert narration is not None
+    rendered = narration.render()
+    assert "命令验证" in rendered
+    assert "rg -n codex gateway" in rendered
+    assert "工具步骤" not in rendered
+
+
+def test_codex_narrator_rolls_recent_activity_into_generic_progress() -> None:
+    command_started = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="codex.notification",
+        payload={
+            "stage": "notification",
+            "method": "item/started",
+            "notification": {
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "rg -n codex gateway",
+                        "cwd": "/repo",
+                    }
+                },
+            },
+        },
+        occurred_at=1.0,
+    )
+    test_completed = CodexRuntimeEvent(
+        id=2,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="codex.notification",
+        payload={
+            "stage": "notification",
+            "method": "item/completed",
+            "notification": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "pytest control_plane/tests/gateway",
+                        "cwd": "/repo",
+                        "aggregatedOutput": "151 passed in 21.13s",
+                    }
+                },
+            },
+        },
+        occurred_at=2.0,
+    )
+    tool_completed = CodexRuntimeEvent(
+        id=3,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.tool_completed",
+        payload={"stage": "tool_completed", "tool_iterations": 35},
+        occurred_at=3.0,
+    )
+
+    narration = CodexFieldNarrator().narrate(
+        tool_completed,
+        recent_events=[command_started, test_completed, tool_completed],
+        workspace="/repo",
+        thread_id="thread",
+    )
+
+    assert narration is not None
+    rendered = narration.render()
+    assert "刚完成一次操作" in rendered
+    assert "测试完成：151 passed" in rendered
+    assert "正在执行命令：rg -n codex gateway" in rendered
+    assert "已完成 35 个工具步骤" not in rendered
+    assert "工具步骤" not in rendered
+
+
+def test_codex_narrator_status_uses_persisted_file_change_context() -> None:
+    file_change = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="codex.notification",
+        payload={
+            "stage": "notification",
+            "method": "item/completed",
+            "notification": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "fileChange",
+                        "changes": [
+                            {"path": "control_plane/gateway/control_planes/codex/narrator.py"},
+                            {"path": "control_plane/tests/gateway/test_codex_command_service.py"},
+                        ],
+                    }
+                },
+            },
+        },
+        occurred_at=time.time() - 3,
+    )
+    tool_completed = CodexRuntimeEvent(
+        id=2,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.tool_completed",
+        payload={"stage": "tool_completed", "tool_iterations": 1},
+        occurred_at=time.time() - 1,
+    )
+
+    text = CodexFieldNarrator().status_text(
+        [file_change, tool_completed],
+        workspace="/repo",
+        thread_id="thread",
+    )
+
+    assert "刚完成一次操作" in text
+    assert "文件修改：" in text
+    assert "narrator.py" in text
+    assert "工具步骤" not in text
+
+
+def test_codex_narrator_caps_rolling_activity_evidence() -> None:
+    long_path = "control_plane/" + "very_long_directory_name/" * 10 + "narrator.py"
+    file_change = CodexRuntimeEvent(
+        id=1,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="codex.notification",
+        payload={
+            "stage": "notification",
+            "method": "item/completed",
+            "notification": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "fileChange",
+                        "changes": [{"path": long_path}],
+                    }
+                },
+            },
+        },
+        occurred_at=time.time() - 3,
+    )
+    tool_completed = CodexRuntimeEvent(
+        id=2,
+        task_key="discord:42:main",
+        task_id="task",
+        thread_id="thread",
+        turn_id="turn",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.tool_completed",
+        payload={"stage": "tool_completed", "tool_iterations": 1},
+        occurred_at=time.time() - 1,
+    )
+
+    text = CodexFieldNarrator().status_text(
+        [file_change, tool_completed],
+        workspace="/repo",
+        thread_id="thread",
+    )
+
+    evidence_lines = [line for line in text.splitlines() if line.startswith("证据：")]
+    assert evidence_lines
+    assert len(evidence_lines[0]) <= 170
+    assert evidence_lines[0].endswith("...")
 
 
 def test_codex_narrator_reports_active_tool_waiting() -> None:

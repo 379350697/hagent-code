@@ -86,30 +86,44 @@ class CodexFieldNarrator:
             return CodexNarration(
                 "native 侧已完成，本地状态已恢复。",
                 importance="high",
-                evidence=["Codex 原生 task_complete 已确认"],
+                evidence=[
+                    "Codex 原生 task_complete 已确认",
+                    *_recent_activity_evidence(
+                        recent_events,
+                        current_event_id=event.id,
+                        skip_waiting=True,
+                        limit=1,
+                    ),
+                ],
                 dedupe_key="turn_completion_recovered",
             )
         if event_type == "progress.native_reconciled":
             status = str(payload.get("native_reconcile_status") or "")
             reason = _one_line(str(payload.get("native_reconcile_reason") or ""), 160)
+            recent = _recent_activity_evidence(
+                recent_events,
+                current_event_id=event.id,
+                skip_waiting=True,
+                limit=1,
+            )
             if status == "failed":
                 return CodexNarration(
                     "native 侧已确认失败，本地状态已恢复。",
                     importance="critical",
-                    evidence=[reason] if reason else ["Codex 原生失败状态已对账"],
+                    evidence=([reason] if reason else ["Codex 原生失败状态已对账"]) + recent,
                     dedupe_key="native_reconciled_failed",
                 )
             if status == "interrupted":
                 return CodexNarration(
                     "native 侧已确认中断，本地状态已恢复。",
                     importance="critical",
-                    evidence=[reason] if reason else ["Codex 原生中断状态已对账"],
+                    evidence=([reason] if reason else ["Codex 原生中断状态已对账"]) + recent,
                     dedupe_key="native_reconciled_interrupted",
                 )
             return CodexNarration(
                 "native 侧已完成，本地状态已恢复。",
                 importance="high",
-                evidence=[reason] if reason else ["Codex 原生状态已对账"],
+                evidence=([reason] if reason else ["Codex 原生状态已对账"]) + recent,
                 dedupe_key="native_reconciled",
             )
         if event_type == "task.recoverable_stale":
@@ -205,7 +219,7 @@ class CodexFieldNarrator:
                     dedupe_key=f"test_completed:{_command_key(command)}",
                 )
             return CodexNarration(
-                "刚完成一个命令步骤，我会继续顺着结果往下查。",
+                "刚完成一次命令验证，我会继续顺着结果往下查。",
                 evidence=[command] if command else [],
                 dedupe_key=f"command_completed:{_command_key(command)}",
             )
@@ -220,7 +234,7 @@ class CodexFieldNarrator:
         if method == "item/completed" and item_type in {"mcpToolCall", "dynamicToolCall"}:
             tool = str(item.get("name") or item.get("toolName") or item_type)
             return CodexNarration(
-                "刚完成一个工具步骤，我会根据结果继续推进。",
+                "外部调用已经返回，我会根据结果继续推进。",
                 evidence=[tool] if tool else [],
                 dedupe_key=f"tool_completed:{tool}",
             )
@@ -230,9 +244,14 @@ class CodexFieldNarrator:
             return None
         if event_type == "progress.tool_completed":
             count = int(payload.get("tool_iterations") or 0)
+            recent = _recent_activity_evidence(
+                recent_events,
+                current_event_id=event.id,
+                limit=2,
+            )
             return CodexNarration(
-                "我刚完成一个工具步骤，正在把结果接到下一步。",
-                evidence=[f"已完成 {count} 个工具步骤"] if count else [],
+                "我刚完成一次操作，正在根据最近结果继续处理。",
+                evidence=recent or ([f"已完成 {count} 次操作"] if count else []),
                 dedupe_key=f"tool_completed:{count}",
             )
         return None
@@ -300,6 +319,88 @@ def event_type_from_progress(progress: dict[str, Any]) -> str:
     if stage:
         return f"progress.{stage}"
     return "progress.unknown"
+
+
+def _recent_activity_evidence(
+    events: list[CodexRuntimeEvent] | None,
+    *,
+    current_event_id: int = 0,
+    skip_waiting: bool = False,
+    limit: int = 2,
+) -> list[str]:
+    if not events or limit <= 0:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for event in reversed(events):
+        if current_event_id and event.id == current_event_id:
+            continue
+        summary = _activity_summary(event, skip_waiting=skip_waiting)
+        summary = _one_line(summary, 160)
+        if not summary or summary in seen:
+            continue
+        seen.add(summary)
+        result.append(summary)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _activity_summary(event: CodexRuntimeEvent, *, skip_waiting: bool = False) -> str:
+    payload = event.payload
+    event_type = event.event_type
+    if payload.get("truncated"):
+        return ""
+    if event_type == "progress.waiting":
+        if skip_waiting:
+            return ""
+        active_tool = _one_line(str(payload.get("active_tool_label") or ""), 120)
+        return f"等待命令返回：{active_tool}" if active_tool else ""
+    if event_type == "progress.unbounded_command_detected":
+        command = _one_line(str(payload.get("command") or ""), 120)
+        return f"命令护栏：{command}" if command else "命令护栏已触发"
+    if event_type == "progress.native_reconciled":
+        status = str(payload.get("native_reconcile_status") or "")
+        if status == "failed":
+            return "native 侧已确认失败，本地状态已恢复"
+        if status == "interrupted":
+            return "native 侧已确认中断，本地状态已恢复"
+        return "native 侧已完成，本地状态已恢复"
+    if event_type == "task.recoverable_stale":
+        return "状态不可确认，已进入恢复/超时路径"
+    if event_type in {"progress.approval_requested", "approval.requested"}:
+        command = _approval_command(payload)
+        return f"等待审批：{command}" if command else "等待审批"
+    if event_type == "progress.tool_completed":
+        count = int(_float_or_zero(payload.get("tool_iterations")))
+        return f"已完成 {count} 次操作" if count else ""
+
+    method = str(payload.get("method") or "")
+    notification = payload.get("notification") if isinstance(payload.get("notification"), dict) else {}
+    item = _event_item(notification)
+    item_type = str(item.get("type") or "")
+    if method == "item/started" and item_type == "commandExecution":
+        command = _command_preview(item)
+        return f"正在执行命令：{command}" if command else "正在执行命令"
+    if method == "item/completed" and item_type == "commandExecution":
+        command = _command_preview(item)
+        output = str(item.get("aggregatedOutput") or "")
+        if _looks_like_test_command(command) or _looks_like_test_output(output):
+            evidence = _test_evidence(output) or command
+            return f"测试完成：{evidence}" if evidence else "测试完成"
+        return f"命令完成：{command}" if command else "命令完成"
+    if method == "item/completed" and item_type == "fileChange":
+        files = _changed_files(item)
+        if files:
+            suffix = ", ".join(files[:3])
+            if len(files) > 3:
+                suffix += f" 等 {len(files)} 个文件"
+            return f"文件修改：{suffix}"
+        return "文件修改已完成"
+    if method == "item/completed" and item_type in {"mcpToolCall", "dynamicToolCall"}:
+        tool = _one_line(str(item.get("name") or item.get("toolName") or item_type), 80)
+        return f"外部调用完成：{tool}" if tool else "外部调用完成"
+    return ""
 
 
 def _event_item(notification: dict[str, Any]) -> dict[str, Any]:
@@ -417,7 +518,7 @@ def _float_or_zero(value: Any) -> float:
 def _localize_runtime_error(text: str) -> str:
     value = re.sub(
         r"codex went silent for ([0-9.]+)s after a tool result; retiring app-server session\.",
-        r"Codex app-server 在工具步骤后 \1 秒没有新事件；已回收本轮运行时。",
+        r"Codex app-server 在上一次操作完成后 \1 秒没有新事件；已回收本轮运行时。",
         str(text or ""),
         flags=re.IGNORECASE,
     )

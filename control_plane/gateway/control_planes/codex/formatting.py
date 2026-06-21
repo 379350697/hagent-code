@@ -108,7 +108,7 @@ def _localize_message(message: str) -> str:
     text = message
     text = re.sub(
         r"codex went silent for ([0-9.]+)s after a tool result; retiring app-server session\.",
-        r"Codex app-server 在工具步骤后 \1 秒没有新事件；已回收本轮运行时。",
+        r"Codex app-server 在上一次操作完成后 \1 秒没有新事件；已回收本轮运行时。",
         text,
         flags=re.IGNORECASE,
     )
@@ -166,4 +166,5 @@ def is_observer_unconfirmed_error(error: Any) -> bool:
         or "没有收到 app-server 活动" in text
         or "without app-server activity" in lowered
         or "app-server 在工具步骤后" in text
+        or "app-server 在上一次操作完成后" in text
     )

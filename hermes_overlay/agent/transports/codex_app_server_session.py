@@ -638,7 +638,7 @@ class CodexAppServerSession:
                     since_epoch=turn_started_wall_at,
                 )
                 result.error = (
-                    f"Codex app-server 在工具步骤后 "
+                    f"Codex app-server 在上一次操作完成后 "
                     f"{post_tool_quiet_timeout:.0f} 秒没有新事件；"
                     f"已回收本轮运行时。"
                 )
@@ -1279,7 +1279,7 @@ def _tool_label(item: dict[str, Any]) -> str:
     command = str(item.get("command") or "")
     if command:
         return redact_sensitive_text(" ".join(command.split()), force=True)[:160]
-    name = str(item.get("name") or item.get("toolName") or item.get("type") or "工具步骤")
+    name = str(item.get("name") or item.get("toolName") or item.get("type") or "一次操作")
     return name[:160]
 
 
@@ -1336,7 +1336,7 @@ def classify_unbounded_command(command: Any) -> Optional[UnboundedCommandMatch]:
         return UnboundedCommandMatch(
             command=redact_sensitive_text(normalized, force=True),
             kind="watch",
-            reason="`watch` 默认无限刷新，会让 Codex 工具步骤保持运行。",
+            reason="`watch` 默认无限刷新，会让 Codex 命令执行保持运行。",
             recommendation="改用有界循环，例如固定 3-5 次执行目标命令并在每次之间短暂 sleep。",
         )
     if executable in {"top", "htop"} and not _has_batch_or_count_limit(executable, args):
