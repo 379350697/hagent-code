@@ -1130,6 +1130,8 @@ class CodexCommandService:
                 sandbox=sandbox,
                 plan_mode=plan_mode,
                 turn_started_at=turn_started_at,
+                completed_at=None,
+                token_usage={},
                 last_message="Codex: turn started",
             )
         if select_session:

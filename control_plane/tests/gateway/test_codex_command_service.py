@@ -383,6 +383,53 @@ async def test_continue_updates_existing_session_record(tmp_path, monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_continue_clears_previous_terminal_fields_while_new_turn_runs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    registry = MemoryRegistry()
+    observations = []
+
+    class InspectingContinueSession(FakeCodexSession):
+        def run_turn(self, user_input, **options):
+            if self.turns >= 1:
+                record = registry.get(task_key="discord:42:main")
+                observations.append(
+                    {
+                        "status": record.status,
+                        "completed_at": record.completed_at,
+                        "token_usage": dict(record.token_usage),
+                        "turn_started_at": record.turn_started_at,
+                    }
+                )
+            return super().run_turn(user_input, **options)
+
+    service = _service(
+        tmp_path,
+        monkeypatch,
+        session_factory=InspectingContinueSession,
+        registry=registry,
+    )
+
+    first = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new 123", workspace="/repo")
+    )
+    old_completed_at = float(registry.records[first.task_id].completed_at or 0.0)
+    registry.records[first.task_id].token_usage = {"totalTokens": 123}
+
+    await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="continue 456", workspace="/repo")
+    )
+
+    assert observations
+    running_state = observations[0]
+    assert running_state["status"] == "running"
+    assert running_state["completed_at"] is None
+    assert running_state["token_usage"] == {}
+    assert running_state["turn_started_at"] > old_completed_at
+
+
+@pytest.mark.asyncio
 async def test_continue_restores_selected_session_after_service_restart(
     tmp_path, monkeypatch,
 ) -> None:
