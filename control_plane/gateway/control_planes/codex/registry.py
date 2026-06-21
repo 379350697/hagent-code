@@ -56,6 +56,7 @@ class CodexTaskRecord:
     title: str = ""
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    turn_started_at: float | None = None
     completed_at: float | None = None
     last_message: str = ""
     token_usage: JsonDict = field(default_factory=dict)
@@ -78,6 +79,7 @@ class CodexTaskRecord:
             "title": self.title,
             "startedAt": self.started_at,
             "updatedAt": self.updated_at,
+            "turnStartedAt": self.turn_started_at,
             "completedAt": self.completed_at,
             "lastMessage": self.last_message,
             "tokenUsage": self.token_usage,
@@ -102,6 +104,9 @@ class CodexTaskRecord:
             title=str(data.get("title") or ""),
             started_at=float(data.get("startedAt") or time.time()),
             updated_at=float(data.get("updatedAt") or time.time()),
+            turn_started_at=(
+                float(data["turnStartedAt"]) if data.get("turnStartedAt") else None
+            ),
             completed_at=(float(data["completedAt"]) if data.get("completedAt") else None),
             last_message=str(data.get("lastMessage") or ""),
             token_usage=data.get("tokenUsage") if isinstance(data.get("tokenUsage"), dict) else {},

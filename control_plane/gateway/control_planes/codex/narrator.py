@@ -90,7 +90,22 @@ class CodexFieldNarrator:
                 dedupe_key="turn_completion_recovered",
             )
         if event_type == "progress.native_reconciled":
+            status = str(payload.get("native_reconcile_status") or "")
             reason = _one_line(str(payload.get("native_reconcile_reason") or ""), 160)
+            if status == "failed":
+                return CodexNarration(
+                    "native 侧已确认失败，本地状态已恢复。",
+                    importance="critical",
+                    evidence=[reason] if reason else ["Codex 原生失败状态已对账"],
+                    dedupe_key="native_reconciled_failed",
+                )
+            if status == "interrupted":
+                return CodexNarration(
+                    "native 侧已确认中断，本地状态已恢复。",
+                    importance="critical",
+                    evidence=[reason] if reason else ["Codex 原生中断状态已对账"],
+                    dedupe_key="native_reconciled_interrupted",
+                )
             return CodexNarration(
                 "native 侧已完成，本地状态已恢复。",
                 importance="high",

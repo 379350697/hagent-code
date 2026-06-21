@@ -20,6 +20,14 @@ class RecoverableTurn:
     message_preview: str
 
 
+@dataclass(frozen=True)
+class NativeTerminalEvent:
+    status: str
+    turn_id: str
+    message: str
+    timestamp: float
+
+
 def find_recoverable_completed_turns(
     registry: Any,
     *,
@@ -86,12 +94,30 @@ def latest_native_task_complete(
     expected_turn_id: str = "",
     since_epoch: float = 0.0,
 ) -> tuple[str, str] | None:
+    terminal = latest_native_terminal_event(
+        thread_id,
+        codex_home=codex_home,
+        expected_turn_id=expected_turn_id,
+        since_epoch=since_epoch,
+    )
+    if terminal is None or terminal.status != "completed":
+        return None
+    return terminal.turn_id, terminal.message
+
+
+def latest_native_terminal_event(
+    thread_id: str,
+    *,
+    codex_home: str = "",
+    expected_turn_id: str = "",
+    since_epoch: float = 0.0,
+) -> NativeTerminalEvent | None:
     if not thread_id:
         return None
     home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
     pattern = os.path.join(home, "sessions", "**", f"*{thread_id}.jsonl")
     best_time = 0.0
-    best: tuple[str, str] | None = None
+    best: NativeTerminalEvent | None = None
     for path in sorted(glob.glob(pattern, recursive=True)):
         try:
             with open(path, "r", encoding="utf-8") as handle:
@@ -100,28 +126,66 @@ def latest_native_task_complete(
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if record.get("type") != "event_msg":
+                    terminal = _native_terminal_from_record(record)
+                    if terminal is None:
                         continue
-                    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-                    if payload.get("type") != "task_complete":
+                    if (
+                        expected_turn_id
+                        and terminal.turn_id
+                        and terminal.turn_id != expected_turn_id
+                    ):
                         continue
-                    turn_id = str(payload.get("turn_id") or "")
-                    if expected_turn_id and turn_id != expected_turn_id:
-                        continue
-                    message = str(payload.get("last_agent_message") or "").strip()
-                    if not message:
-                        continue
-                    timestamp = _parse_timestamp(record.get("timestamp"))
+                    timestamp = terminal.timestamp
                     if since_epoch and (
                         not timestamp or timestamp < since_epoch - 5.0
                     ):
                         continue
                     if timestamp >= best_time:
                         best_time = timestamp
-                        best = (turn_id, message)
+                        best = terminal
         except OSError:
             continue
     return best
+
+
+def _native_terminal_from_record(record: dict[str, Any]) -> NativeTerminalEvent | None:
+    if not isinstance(record, dict) or record.get("type") != "event_msg":
+        return None
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    event_type = str(payload.get("type") or "")
+    timestamp = _parse_timestamp(record.get("timestamp"))
+    turn_id = str(payload.get("turn_id") or "")
+    if event_type == "task_complete":
+        message = str(payload.get("last_agent_message") or "").strip()
+        if not message:
+            return None
+        return NativeTerminalEvent(
+            status="completed",
+            turn_id=turn_id,
+            message=message,
+            timestamp=timestamp,
+        )
+    if event_type in {"turn_aborted", "task_aborted", "task_interrupted"}:
+        message = str(
+            payload.get("message") or payload.get("error") or event_type
+        ).strip()
+        return NativeTerminalEvent(
+            status="interrupted",
+            turn_id=turn_id,
+            message=message or "Codex native turn interrupted",
+            timestamp=timestamp,
+        )
+    if event_type in {"task_failed", "turn_failed"}:
+        message = str(
+            payload.get("message") or payload.get("error") or event_type
+        ).strip()
+        return NativeTerminalEvent(
+            status="failed",
+            turn_id=turn_id,
+            message=message or "Codex native task failed",
+            timestamp=timestamp,
+        )
+    return None
 
 
 def _parse_timestamp(value: Any) -> float:

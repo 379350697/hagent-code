@@ -121,6 +121,7 @@ class UnboundedCommandMatch:
     kind: str
     reason: str
     recommendation: str
+    strict_only: bool = False
 
     @property
     def user_message(self) -> str:
@@ -1002,7 +1003,8 @@ class CodexAppServerSession:
     ) -> str:
         command = params.get("command") or ""
         match = classify_unbounded_command(command)
-        if _should_hard_block_unbounded(match, unbounded_command_policy):
+        hard_block = _should_hard_block_unbounded(match, unbounded_command_policy)
+        if hard_block:
             self._last_approval_error = match.user_message
             if progress_callback is not None:
                 progress_callback(
@@ -1016,7 +1018,11 @@ class CodexAppServerSession:
                     source="approval_request",
                 )
             return "decline"
-        if match is not None and unbounded_command_policy == "warn_only":
+        if (
+            match is not None
+            and normalize_unbounded_command_policy(unbounded_command_policy) != "off"
+            and not hard_block
+        ):
             if progress_callback is not None:
                 progress_callback(
                     "unbounded_command_detected",
@@ -1354,6 +1360,29 @@ def classify_unbounded_command(command: Any) -> Optional[UnboundedCommandMatch]:
             reason="未带次数限制的 `ping` 会持续运行。",
             recommendation="改用 `ping -c 3 <host>` 或带明确 deadline/count 的网络探测。",
         )
+    if (
+        executable
+        in {"python", "python3", "node", "irb", "pry", "iex", "ghci", "sqlite3", "psql"}
+        and not args
+    ):
+        return UnboundedCommandMatch(
+            command=redact_sensitive_text(normalized, force=True),
+            kind="interactive_repl",
+            reason=f"`{executable}` 不带脚本/参数时会进入交互式 REPL。",
+            recommendation=(
+                "改用带脚本、`-c` 片段或有界的一次性命令；"
+                "需要全硬拦截时使用 strict_hard。"
+            ),
+            strict_only=True,
+        )
+    if executable in {"bash", "sh", "zsh", "fish"} and not args:
+        return UnboundedCommandMatch(
+            command=redact_sensitive_text(normalized, force=True),
+            kind="interactive_shell",
+            reason=f"`{executable}` 不带命令时会进入交互式 shell。",
+            recommendation="改用 `bash -lc '<bounded command>'`，并确保内部命令有明确退出条件。",
+            strict_only=True,
+        )
     return None
 
 
@@ -1364,7 +1393,9 @@ def _should_hard_block_unbounded(
     if match is None:
         return False
     normalized = normalize_unbounded_command_policy(policy)
-    return normalized in {"conditional_hard", "strict_hard"}
+    if normalized == "strict_hard":
+        return True
+    return normalized == "conditional_hard" and not match.strict_only
 
 
 def _normalize_command_text(command: Any) -> str:
@@ -1415,7 +1446,7 @@ def _has_flag(args: list[str], *flags: str) -> bool:
 
 def _has_ping_count_limit(args: list[str]) -> bool:
     for index, arg in enumerate(args):
-        if arg in {"-c", "-w", "-W"} and index + 1 < len(args):
+        if arg in {"-c", "-w", "--deadline"} and index + 1 < len(args):
             return True
         if arg.startswith("-c") and len(arg) > 2:
             return True

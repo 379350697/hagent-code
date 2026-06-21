@@ -39,7 +39,7 @@ from .runtime_config import (
 from .repair import (
     apply_recovered_turns,
     find_recoverable_completed_turns,
-    latest_native_task_complete,
+    latest_native_terminal_event,
 )
 from .selection import SelectedSessionStore
 from .session_pool import CodexSessionPool, LiveSession
@@ -65,6 +65,7 @@ class CodexCommandService:
         session_factory: Optional[Callable[..., CodexAppServerSession]] = None,
         event_store: Any = None,
         narrator: CodexFieldNarrator | None = None,
+        start_watchdog: bool | None = None,
     ) -> None:
         if registry is None:
             registry = CodexTaskRegistry()
@@ -74,6 +75,16 @@ class CodexCommandService:
         self._sessions = CodexSessionPool(session_factory=session_factory)
         self._event_store = event_store or CodexRuntimeEventStore()
         self._narrator = narrator or CodexFieldNarrator()
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        if start_watchdog is None:
+            start_watchdog = (
+                isinstance(self._registry, CodexTaskRegistry)
+                and os.environ.get("HERMES_CODEX_WATCHDOG", "1").strip().lower()
+                not in {"0", "false", "no", "off"}
+            )
+        if start_watchdog:
+            self._start_watchdog()
 
     async def handle(self, request: CommandRequest) -> CommandResult:
         raw_args = (request.text or "").strip()
@@ -311,7 +322,13 @@ class CodexCommandService:
             thread_id=str(getattr(record, "thread_id", "") or ""),
         )
 
-    def _reconcile_status_record(self, record: Any, task_key: str) -> Any:
+    def _reconcile_status_record(
+        self,
+        record: Any,
+        task_key: str,
+        *,
+        codex_cfg: dict[str, Any] | None = None,
+    ) -> Any:
         status = str(getattr(record, "status", "") or "")
         if status not in {"starting", "planning", "running", "busy", "recoverable_stale"}:
             return record
@@ -320,24 +337,25 @@ class CodexCommandService:
         if not task_id or not thread_id:
             return record
         turn_id = str(getattr(record, "turn_id", "") or "")
-        since_epoch = float(
-            getattr(record, "updated_at", None)
-            or getattr(record, "started_at", None)
-            or 0.0
-        )
-        complete = latest_native_task_complete(
+        terminal = latest_native_terminal_event(
             thread_id,
             expected_turn_id=turn_id,
-            since_epoch=since_epoch,
+            since_epoch=self._native_reconcile_since(record),
         )
-        if complete is not None:
-            native_turn_id, message = complete
+        if terminal is not None:
+            native_turn_id = terminal.turn_id
+            message = terminal.message
+            last_message = {
+                "completed": "Codex: turn completed",
+                "interrupted": "Codex: turn interrupted",
+                "failed": f"Codex native task failed: {message}",
+            }.get(terminal.status, f"Codex native terminal: {message}")
             updated = self._registry.update(
                 task_id,
-                status="completed",
+                status=terminal.status,
                 turn_id=native_turn_id or turn_id,
                 completed_at=time.time(),
-                last_message="Codex: turn completed",
+                last_message=last_message,
             )
             self._append_runtime_event(
                 task_key=task_key,
@@ -347,8 +365,8 @@ class CodexCommandService:
                 event_type="progress.native_reconciled",
                 payload={
                     "stage": "native_reconciled",
-                    "native_reconcile_status": "completed",
-                    "native_reconcile_reason": "native task_complete confirmed",
+                    "native_reconcile_status": terminal.status,
+                    "native_reconcile_reason": f"native terminal event confirmed: {terminal.status}",
                     "message_preview": " ".join(message.split())[:160],
                 },
                 workspace=str(getattr(record, "workspace", "") or ""),
@@ -357,7 +375,8 @@ class CodexCommandService:
         live = self._sessions.peek(task_key)
         if live is not None and live.lock.locked():
             return record
-        stale_after = self._stale_running_seconds(load_codex_cfg())
+        cfg = codex_cfg if isinstance(codex_cfg, dict) else load_codex_cfg()
+        stale_after = self._stale_running_seconds(cfg)
         updated_at = float(getattr(record, "updated_at", None) or 0.0)
         if status != "recoverable_stale" and updated_at and (time.time() - updated_at) >= stale_after:
             updated = self._registry.update(
@@ -383,6 +402,68 @@ class CodexCommandService:
             )
             return updated or record
         return record
+
+    @staticmethod
+    def _native_reconcile_since(record: Any) -> float:
+        return float(
+            getattr(record, "turn_started_at", None)
+            or getattr(record, "started_at", None)
+            or 0.0
+        )
+
+    def sweep_stale_tasks(self, *, limit: int | None = None) -> int:
+        codex_cfg = load_codex_cfg()
+        scan_limit = limit or self._watchdog_scan_limit(codex_cfg)
+        try:
+            records = self._registry.list(limit=scan_limit)
+        except TypeError:
+            records = self._registry.list()
+        except Exception:
+            logger.debug("Codex watchdog registry list failed", exc_info=True)
+            return 0
+        changed = 0
+        for record in records:
+            before = (
+                str(getattr(record, "status", "") or ""),
+                str(getattr(record, "turn_id", "") or ""),
+                str(getattr(record, "last_message", "") or ""),
+            )
+            updated = self._reconcile_status_record(
+                record,
+                str(getattr(record, "task_key", "") or ""),
+                codex_cfg=codex_cfg,
+            )
+            after = (
+                str(getattr(updated, "status", "") or ""),
+                str(getattr(updated, "turn_id", "") or ""),
+                str(getattr(updated, "last_message", "") or ""),
+            )
+            if after != before:
+                changed += 1
+        return changed
+
+    def _start_watchdog(self) -> None:
+        if self._watchdog_thread is not None:
+            return
+
+        def loop() -> None:
+            while not self._watchdog_stop.is_set():
+                interval = self._watchdog_interval_seconds(load_codex_cfg())
+                if interval <= 0:
+                    return
+                if self._watchdog_stop.wait(interval):
+                    return
+                try:
+                    self.sweep_stale_tasks()
+                except Exception:
+                    logger.debug("Codex watchdog sweep failed", exc_info=True)
+
+        self._watchdog_thread = threading.Thread(
+            target=loop,
+            name="codex-stale-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
 
     async def _doctor(self, request: CommandRequest, task_key: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
@@ -1009,6 +1090,7 @@ class CodexCommandService:
         record = None if new_session else self._session_record(task_key, thread_id)
         task_id = getattr(record, "task_id", "") or task_id_for(thread_id)
         live.active_task_id = task_id
+        turn_started_at = time.time()
         progress_callback = self._progress_callback(
             progress_notify,
             task_key=task_key,
@@ -1020,22 +1102,22 @@ class CodexCommandService:
             interval_seconds=self._progress_interval_seconds(codex_cfg),
         )
         if record is None:
-            self._registry.upsert(
-                make_task_record(
-                    task_id=task_id,
-                    task_key=task_key,
-                    status="planning" if plan_mode else "running",
-                    workspace=workspace,
-                    thread_id=thread_id,
-                    turn_id="",
-                    model=model,
-                    approval=approval,
-                    sandbox=sandbox,
-                    plan_mode=plan_mode,
-                    prompt=prompt,
-                    last_message="Codex: turn started",
-                )
+            new_record = make_task_record(
+                task_id=task_id,
+                task_key=task_key,
+                status="planning" if plan_mode else "running",
+                workspace=workspace,
+                thread_id=thread_id,
+                turn_id="",
+                model=model,
+                approval=approval,
+                sandbox=sandbox,
+                plan_mode=plan_mode,
+                prompt=prompt,
+                last_message="Codex: turn started",
             )
+            new_record.turn_started_at = turn_started_at
+            self._registry.upsert(new_record)
         else:
             self._registry.update(
                 task_id,
@@ -1047,6 +1129,7 @@ class CodexCommandService:
                 approval_policy=approval,
                 sandbox=sandbox,
                 plan_mode=plan_mode,
+                turn_started_at=turn_started_at,
                 last_message="Codex: turn started",
             )
         if select_session:
@@ -1141,7 +1224,11 @@ class CodexCommandService:
             turn_id_value = str(event.get("turn_id") or "")
             if turn_id_value and event_type == "progress.turn_started":
                 try:
-                    self._registry.update(task_id, turn_id=turn_id_value)
+                    self._registry.update(
+                        task_id,
+                        turn_id=turn_id_value,
+                        turn_started_at=time.time(),
+                    )
                 except Exception:
                     logger.debug("Codex turn_id registry update failed", exc_info=True)
             stored = self._append_runtime_event(
@@ -1276,6 +1363,27 @@ class CodexCommandService:
         except (TypeError, ValueError):
             return 900.0
         return value if value > 0 else 900.0
+
+    @staticmethod
+    def _watchdog_interval_seconds(codex_cfg: dict[str, Any]) -> float:
+        try:
+            value = float(
+                codex_cfg.get(
+                    "stale_watchdog_interval_seconds",
+                    codex_cfg.get("watchdog_interval_seconds", 60.0),
+                )
+            )
+        except (TypeError, ValueError):
+            return 60.0
+        return value if value >= 0 else 60.0
+
+    @staticmethod
+    def _watchdog_scan_limit(codex_cfg: dict[str, Any]) -> int:
+        try:
+            value = int(codex_cfg.get("stale_watchdog_scan_limit", 100))
+        except (TypeError, ValueError):
+            return 100
+        return max(1, value)
 
     def _session_record(self, task_key: str, thread_id: str) -> Any:
         try:

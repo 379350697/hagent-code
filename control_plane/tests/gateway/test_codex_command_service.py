@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import datetime, timezone
 import json
 import time
 
@@ -207,6 +208,7 @@ class MemoryRegistry:
         for key, value in fields.items():
             if hasattr(record, key):
                 setattr(record, key, value)
+        record.updated_at = time.time()
         return record
 
     def get(self, task_id=None, *, task_key=None, thread_id=None):
@@ -1102,6 +1104,185 @@ async def test_codex_status_marks_old_running_record_recoverable_stale(
     assert "最近一轮：待恢复" in status.text
     assert "状态不可确认" in status.text
     assert registry.records["stale123"].status == "recoverable_stale"
+
+
+@pytest.mark.asyncio
+async def test_codex_status_recovers_stale_record_using_turn_started_at(
+    tmp_path, monkeypatch,
+) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+
+    codex_home = tmp_path / "codex"
+    session_dir = codex_home / "sessions" / "2026" / "06" / "21"
+    session_dir.mkdir(parents=True)
+    now = time.time()
+    native_timestamp = datetime.fromtimestamp(now - 30, timezone.utc).isoformat()
+    native_record = {
+        "timestamp": native_timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "turn_id": "turn-stale",
+            "last_agent_message": "completed before stale marker",
+        },
+    }
+    (session_dir / "rollout-2026-thread-stale-complete.jsonl").write_text(
+        json.dumps(native_record) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    registry = MemoryRegistry()
+    record = make_task_record(
+        task_id="stalecomplete123",
+        task_key="discord:42:main",
+        status="recoverable_stale",
+        workspace="/repo",
+        thread_id="thread-stale-complete",
+        turn_id="turn-stale",
+        model="gpt-5.5",
+        approval="on-request",
+        sandbox="workspace-write",
+        plan_mode=False,
+        prompt="original",
+        last_message="Codex 状态不可确认，进入恢复/超时路径",
+    )
+    record.turn_started_at = now - 60
+    record.updated_at = now
+    registry.upsert(record)
+    record.turn_started_at = now - 60
+    record.updated_at = now
+    service = _service(tmp_path, monkeypatch, registry=registry)
+
+    status = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="status")
+    )
+
+    assert status.status == "completed"
+    assert registry.records["stalecomplete123"].status == "completed"
+    assert "native 侧已完成" in status.text
+
+
+@pytest.mark.asyncio
+async def test_codex_status_reconciles_native_failed_and_interrupted(
+    tmp_path, monkeypatch,
+) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+
+    codex_home = tmp_path / "codex"
+    session_dir = codex_home / "sessions" / "2026" / "06" / "21"
+    session_dir.mkdir(parents=True)
+    now = time.time()
+    failed_record = {
+        "timestamp": datetime.fromtimestamp(now - 20, timezone.utc).isoformat(),
+        "type": "event_msg",
+        "payload": {
+            "type": "task_failed",
+            "turn_id": "turn-failed",
+            "message": "native failure",
+        },
+    }
+    interrupted_record = {
+        "timestamp": datetime.fromtimestamp(now - 10, timezone.utc).isoformat(),
+        "type": "event_msg",
+        "payload": {
+            "type": "turn_aborted",
+            "turn_id": "turn-interrupted",
+            "message": "native aborted",
+        },
+    }
+    (session_dir / "rollout-2026-thread-failed.jsonl").write_text(
+        json.dumps(failed_record) + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "rollout-2026-thread-interrupted.jsonl").write_text(
+        json.dumps(interrupted_record) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    registry = MemoryRegistry()
+    for task_id, thread_id, turn_id in (
+        ("failed123", "thread-failed", "turn-failed"),
+        ("interrupted123", "thread-interrupted", "turn-interrupted"),
+    ):
+        record = make_task_record(
+            task_id=task_id,
+            task_key=f"discord:42:{task_id}",
+            status="running",
+            workspace="/repo",
+            thread_id=thread_id,
+            turn_id=turn_id,
+            model="gpt-5.5",
+            approval="on-request",
+            sandbox="workspace-write",
+            plan_mode=False,
+            prompt="original",
+            last_message="Codex: turn started",
+        )
+        record.turn_started_at = now - 60
+        registry.upsert(record)
+        registry.records[task_id].turn_started_at = now - 60
+    service = _service(tmp_path, monkeypatch, registry=registry)
+
+    failed = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", thread_id="failed123", text="status")
+    )
+    interrupted = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", thread_id="interrupted123", text="status")
+    )
+
+    assert failed.status == "failed"
+    assert "native 侧已确认失败" in failed.text
+    assert interrupted.status == "interrupted"
+    assert "native 侧已确认中断" in interrupted.text
+
+
+def test_codex_watchdog_sweep_reconciles_without_status_command(
+    tmp_path, monkeypatch,
+) -> None:
+    from gateway.control_planes.codex.records import make_task_record
+
+    codex_home = tmp_path / "codex"
+    session_dir = codex_home / "sessions" / "2026" / "06" / "21"
+    session_dir.mkdir(parents=True)
+    now = time.time()
+    native_record = {
+        "timestamp": datetime.fromtimestamp(now - 10, timezone.utc).isoformat(),
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "turn_id": "turn-watch",
+            "last_agent_message": "watchdog recovered",
+        },
+    }
+    (session_dir / "rollout-2026-thread-watch.jsonl").write_text(
+        json.dumps(native_record) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    registry = MemoryRegistry()
+    record = make_task_record(
+        task_id="watch123",
+        task_key="discord:42:main",
+        status="running",
+        workspace="/repo",
+        thread_id="thread-watch",
+        turn_id="turn-watch",
+        model="gpt-5.5",
+        approval="on-request",
+        sandbox="workspace-write",
+        plan_mode=False,
+        prompt="original",
+        last_message="Codex: turn started",
+    )
+    record.turn_started_at = now - 60
+    registry.upsert(record)
+    registry.records["watch123"].turn_started_at = now - 60
+    service = _service(tmp_path, monkeypatch, registry=registry)
+
+    changed = service.sweep_stale_tasks()
+
+    assert changed == 1
+    assert registry.records["watch123"].status == "completed"
 
 
 @pytest.mark.asyncio

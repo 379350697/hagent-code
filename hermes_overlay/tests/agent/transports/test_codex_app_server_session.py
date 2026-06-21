@@ -145,7 +145,9 @@ class TestUnboundedCommandClassification:
             ("htop", "htop"),
             ("less +F /tmp/app.log", "less_follow"),
             ("ping example.com", "ping"),
+            ("ping -W 1 example.com", "ping"),
             ("/bin/bash -lc \"journalctl --user -u lightld.service -f --no-pager\"", "journalctl_follow"),
+            ("/bin/bash -lc python3", "interactive_repl"),
         ],
     )
     def test_matches_unbounded_commands(self, command, kind):
@@ -161,6 +163,7 @@ class TestUnboundedCommandClassification:
             "journalctl --user -u lightld.service -n 120 --no-pager",
             "tail -n 120 /tmp/app.log",
             "ping -c 3 example.com",
+            "ping -w 3 example.com",
             "top -b -n 1",
             "ps -ef",
         ],
@@ -831,6 +834,59 @@ class TestServerRequestRouting:
             and item.get("source") == "command_started"
             for item in progress
         )
+
+    def test_strict_only_repl_warns_in_conditional_but_blocks_in_strict(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="r1",
+            command="/bin/bash -lc python3",
+            cwd="/",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        progress: list[dict] = []
+        s = make_session(client, approval_callback=lambda *_args, **_kwargs: "once")
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            unbounded_command_policy="conditional_hard",
+            progress_callback=lambda event: progress.append(event),
+        )
+
+        assert r.error is None
+        assert ("r1", {"decision": "accept"}) in client.responses
+        assert any(
+            item.get("stage") == "unbounded_command_detected"
+            and item.get("blocked") is False
+            for item in progress
+        )
+
+        strict_client = FakeClient()
+        strict_client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="r2",
+            command="/bin/bash -lc python3",
+            cwd="/",
+        )
+        strict_client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        strict_session = make_session(
+            strict_client,
+            approval_callback=lambda *_args, **_kwargs: "once",
+        )
+        strict_result = strict_session.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            unbounded_command_policy="strict_hard",
+        )
+
+        assert strict_result.error and "无界命令" in strict_result.error
+        assert ("r2", {"decision": "decline"}) in strict_client.responses
 
     def test_callback_raises_falls_back_to_decline(self):
         client = FakeClient()
