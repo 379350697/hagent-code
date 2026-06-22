@@ -36,6 +36,30 @@ def _ensure_discord_mock():
     discord_mod.ForumChannel = type("ForumChannel", (), {})
     discord_mod.Interaction = object
 
+    # A real (tiny) Embed so tests can assert on description / color without
+    # fighting MagicMock attribute access. _run_simple_slash builds a green-bar
+    # embed for echoed commands.
+    class _FakeColor:
+        @staticmethod
+        def green():
+            return "green"
+
+        @staticmethod
+        def orange():
+            return "orange"
+
+    class _FakeEmbed:
+        def __init__(self, *, description="", color=None, **kwargs):
+            self.description = description
+            self.color = color
+            self.fields = []
+
+        def add_field(self, *, name, value, inline=False):
+            self.fields.append({"name": name, "value": value, "inline": inline})
+
+    discord_mod.Embed = _FakeEmbed
+    discord_mod.Color = _FakeColor
+
     # Lightweight mock for app_commands.Group and Command used by
     # _register_skill_group.
     class _FakeGroup:
@@ -314,13 +338,15 @@ async def test_simple_slash_defer_failure_does_not_dispatch(adapter):
 
 @pytest.mark.asyncio
 async def test_simple_slash_sends_preface_after_defer(adapter):
-    """A caller-provided preface is sent after defer as a plain channel message."""
+    """A caller-provided preface is merged with the echo line into a single
+    green-bar Embed, sent after defer."""
     defer_mock = AsyncMock()
-    sends = []
+    sent_embeds = []
 
     class _Chan:
-        async def send(self, content):
-            sends.append(content)
+        async def send(self, content=None, *, embed=None):
+            if embed is not None:
+                sent_embeds.append(embed)
 
     adapter.handle_message = AsyncMock()
     interaction = SimpleNamespace(
@@ -340,10 +366,13 @@ async def test_simple_slash_sends_preface_after_defer(adapter):
 
     # defer happened (the precondition for the deadline-safe send).
     defer_mock.assert_awaited_once()
-    # preface was delivered as a plain channel message.
-    assert "> 📍 当前：wlcodex · 任务标题" in sends
-    # the echo "下达任务" line was also delivered.
-    assert any("下达任务" in s for s in sends)
+    # one green-bar Embed carrying both the preface and the echo line.
+    assert len(sent_embeds) == 1
+    embed = sent_embeds[0]
+    assert embed.color == "green"
+    assert "> 📍 当前：wlcodex · 任务标题" in embed.description
+    assert "下达任务" in embed.description
+    assert "/codex continue 继续执行" in embed.description
     # and the command dispatched.
     adapter.handle_message.assert_awaited_once()
 
@@ -351,21 +380,22 @@ async def test_simple_slash_sends_preface_after_defer(adapter):
 @pytest.mark.asyncio
 async def test_simple_slash_invokes_preface_callable_after_defer(adapter):
     """A callable preface is invoked AFTER defer (so blocking work it does
-    cannot blow the 3s interaction deadline) and its result sent as a message.
+    cannot blow the 3s interaction deadline) and its result merged into the
+    green-bar Embed.
     """
-    defer_mock = AsyncMock()
-    sends = []
     call_order = []
+    sent_embeds = []
 
     class _Chan:
-        async def send(self, content):
-            sends.append(content)
+        async def send(self, content=None, *, embed=None):
+            if embed is not None:
+                sent_embeds.append(embed)
 
-    real_defer = defer_mock
+    defer_mock = AsyncMock()
 
     async def _defer(*a, **k):
         call_order.append("defer")
-        await real_defer(*a, **k)
+        await defer_mock(*a, **k)
 
     adapter.handle_message = AsyncMock()
     interaction = SimpleNamespace(
@@ -390,7 +420,9 @@ async def test_simple_slash_invokes_preface_callable_after_defer(adapter):
     # the callable was invoked, after defer.
     assert call_order[:1] == ["defer"]
     assert "preface" in call_order
-    assert "> 📍 当前：wlcodex · 任务标题" in sends
+    # its result landed in the green-bar Embed description.
+    assert len(sent_embeds) == 1
+    assert "> 📍 当前：wlcodex · 任务标题" in sent_embeds[0].description
 
 
 @pytest.mark.asyncio
@@ -446,7 +478,7 @@ async def test_codex_continue_has_no_autocomplete_and_passes_real_context_prefac
 
     # No autocomplete filter dropdown on the `task` option.
     assert not getattr(continue_cmd, "autocomplete", {})
-    assert continue_cmd.descriptions["task"] == "继续要求（直接输入，无需选择）"
+    assert continue_cmd.descriptions["task"] == "继续要求"
 
     interaction = SimpleNamespace(channel=SimpleNamespace(id=42), channel_id=42)
     await continue_cmd.callback(interaction, task="继续执行")
@@ -499,7 +531,7 @@ async def test_claude_continue_has_no_autocomplete_and_passes_real_context_prefa
 
     # No autocomplete filter dropdown on the `task` option.
     assert not getattr(continue_cmd, "autocomplete", {})
-    assert continue_cmd.descriptions["task"] == "继续要求（直接输入，无需选择）"
+    assert continue_cmd.descriptions["task"] == "继续要求"
 
     interaction = SimpleNamespace(channel=SimpleNamespace(id=42), channel_id=42)
     await continue_cmd.callback(interaction, task="继续修")

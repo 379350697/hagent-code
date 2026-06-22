@@ -3397,21 +3397,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if not await self._check_slash_authorization(interaction, command_text):
             return
 
-        if echo and interaction.channel:
-            try:
-                user_name = interaction.user.display_name
-                await interaction.channel.send(
-                    f"> 📋 **{user_name}** 下达任务：`{command_text}`"
-                )
-            except Exception:
-                pass
-
-        # Optional visible preface, sent after defer (safe re: the 3s
-        # interaction deadline) and before dispatch. May be a plain string or a
+        # Resolve the optional preface first. May be a plain string or a
         # zero-arg callable returning a string — the callable is invoked AFTER
         # defer so any blocking work it does (e.g. reading the control-plane
         # registry to build the live workspace · session title) cannot blow the
-        # interaction deadline.
+        # 3-second interaction deadline.
         preface_text: str | None = None
         if callable(preface):
             try:
@@ -3420,9 +3410,25 @@ class DiscordAdapter(BasePlatformAdapter):
                 preface_text = None
         elif preface:
             preface_text = preface
-        if preface_text and interaction.channel:
+
+        # When echoing, surface the invocation as a single prominent green-bar
+        # Embed (deep background + colored left rail) so the "下达成任务" line is
+        # easy to spot. The live workspace · session context (preface) is merged
+        # into the same Embed when present, so continue shows one tidy box:
+        #   ┃ 📍 当前：wlcodex · 任务标题
+        #   ┃ 📋 王小帅 下达任务：`/claude continue ...`
+        if echo and interaction.channel:
             try:
-                await interaction.channel.send(preface_text)
+                user_name = interaction.user.display_name
+                lines = []
+                if preface_text:
+                    lines.append(str(preface_text))
+                lines.append(f"📋 **{user_name}** 下达任务：`{command_text}`")
+                embed = discord.Embed(
+                    description="\n".join(lines),
+                    color=discord.Color.green(),
+                )
+                await interaction.channel.send(embed=embed)
             except Exception:
                 pass
 
@@ -3648,7 +3654,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return ""
 
         @codex_group.command(name="continue", description="继续当前 Codex 会话")
-        @discord.app_commands.describe(task="继续要求（直接输入，无需选择）")
+        @discord.app_commands.describe(task="继续要求")
         async def _codex_continue(interaction: discord.Interaction, task: str):
             # Show the current workspace · session title as a plain context
             # line above the dispatched task — displayed only, never a
@@ -3887,7 +3893,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return ""
 
         @claude_group.command(name="continue", description="继续当前 Claude 会话")
-        @discord.app_commands.describe(task="继续要求（直接输入，无需选择）")
+        @discord.app_commands.describe(task="继续要求")
         async def _claude_continue(interaction: discord.Interaction, task: str):
             # Show the current workspace · session title as a plain context
             # line above the dispatched task — displayed only, never a
