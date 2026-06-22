@@ -279,12 +279,11 @@ async def test_claude_new_and_continue_dispatch_canonical_usage(adapter):
         interaction,
         "/claude continue ship the follow-up",
     )
-    # continue passes echo=True plus a preface context line (None here because
-    # no service/session is wired up in this registration-only test).
-    assert adapter._run_simple_slash.await_args_list[1].kwargs == {
-        "echo": True,
-        "preface": None,
-    }
+    # continue passes echo=True plus a preface callable (which yields "" here
+    # because no service/session is wired up in this registration-only test).
+    preface = adapter._run_simple_slash.await_args_list[1].kwargs.get("preface")
+    assert callable(preface)
+    assert preface() == ""
     assert adapter._run_simple_slash.await_args_list[2].args == (
         interaction,
         "/claude session 1",
@@ -347,6 +346,51 @@ async def test_simple_slash_sends_preface_after_defer(adapter):
     assert any("下达任务" in s for s in sends)
     # and the command dispatched.
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_simple_slash_invokes_preface_callable_after_defer(adapter):
+    """A callable preface is invoked AFTER defer (so blocking work it does
+    cannot blow the 3s interaction deadline) and its result sent as a message.
+    """
+    defer_mock = AsyncMock()
+    sends = []
+    call_order = []
+
+    class _Chan:
+        async def send(self, content):
+            sends.append(content)
+
+    real_defer = defer_mock
+
+    async def _defer(*a, **k):
+        call_order.append("defer")
+        await real_defer(*a, **k)
+
+    adapter.handle_message = AsyncMock()
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=_defer),
+        channel=_Chan(),
+        channel_id=123,
+        user=SimpleNamespace(display_name="0xLL", name="0xLL", id=42),
+        guild_id=99,
+    )
+
+    def _preface():
+        call_order.append("preface")
+        return "> 📍 当前：wlcodex · 任务标题"
+
+    await adapter._run_simple_slash(
+        interaction,
+        "/codex continue 继续执行",
+        echo=True,
+        preface=_preface,
+    )
+
+    # the callable was invoked, after defer.
+    assert call_order[:1] == ["defer"]
+    assert "preface" in call_order
+    assert "> 📍 当前：wlcodex · 任务标题" in sends
 
 
 @pytest.mark.asyncio
@@ -413,9 +457,12 @@ async def test_codex_continue_has_no_autocomplete_and_passes_real_context_prefac
     assert args[0] is interaction
     assert args[1] == "/codex continue 继续执行"
     assert kwargs.get("echo") is True
-    # The real workspace · title is passed as the preface context line.
+    # The real workspace · title is built by a preface callable (invoked after
+    # defer by _run_simple_slash), so the blocking registry read never risks
+    # the interaction deadline.
     preface = kwargs.get("preface")
-    assert preface == "> 📍 当前：wlcodex · 看下 web 模式会话流是否真实流式"
+    assert callable(preface)
+    assert preface() == "> 📍 当前：wlcodex · 看下 web 模式会话流是否真实流式"
 
 
 @pytest.mark.asyncio
@@ -464,7 +511,8 @@ async def test_claude_continue_has_no_autocomplete_and_passes_real_context_prefa
     assert args[1] == "/claude continue 继续修"
     assert kwargs.get("echo") is True
     preface = kwargs.get("preface")
-    assert preface == "> 📍 当前：hagent-code · 检查 Discord 注册菜单"
+    assert callable(preface)
+    assert preface() == "> 📍 当前：hagent-code · 检查 Discord 注册菜单"
 
 
 # ------------------------------------------------------------------

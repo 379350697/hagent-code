@@ -3350,7 +3350,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
         When *preface* is provided it is sent as a visible channel message
         *after* the interaction is deferred (so it never risks the 3-second
-        interaction deadline) and before the command is dispatched.
+        interaction deadline) and before the command is dispatched. *preface*
+        may be a plain string or a zero-arg callable returning a string; a
+        callable is invoked after defer, so any blocking work it does (e.g.
+        building the live workspace · session title from the control-plane
+        registry) cannot blow the interaction deadline.
         """
 
         # Log the invoker so ghost-command reports can be triaged.  Discord
@@ -3403,10 +3407,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 pass
 
         # Optional visible preface, sent after defer (safe re: the 3s
-        # interaction deadline) and before dispatch.
-        if preface and interaction.channel:
+        # interaction deadline) and before dispatch. May be a plain string or a
+        # zero-arg callable returning a string — the callable is invoked AFTER
+        # defer so any blocking work it does (e.g. reading the control-plane
+        # registry to build the live workspace · session title) cannot blow the
+        # interaction deadline.
+        preface_text: str | None = None
+        if callable(preface):
             try:
-                await interaction.channel.send(preface)
+                preface_text = preface() or None
+            except Exception:
+                preface_text = None
+        elif preface:
+            preface_text = preface
+        if preface_text and interaction.channel:
+            try:
+                await interaction.channel.send(preface_text)
             except Exception:
                 pass
 
@@ -3638,12 +3654,15 @@ class DiscordAdapter(BasePlatformAdapter):
             # line above the dispatched task — displayed only, never a
             # search/filter dropdown. /codex continue always resumes the
             # currently-selected session, so there is nothing to pick. The
-            # preface is sent by _run_simple_slash *after* defer, so it can
-            # never blow the 3-second interaction deadline.
-            label = _codex_continue_context_label(interaction)
-            preface = f"> 📍 {label}" if label else None
+            # preface is a *callable* invoked by _run_simple_slash AFTER defer,
+            # so the (potentially blocking) registry read that builds the live
+            # label can never blow the 3-second interaction deadline.
+            def _preface() -> str:
+                label = _codex_continue_context_label(interaction)
+                return f"> 📍 {label}" if label else ""
+
             await self._run_simple_slash(
-                interaction, f"/codex continue {task}", echo=True, preface=preface,
+                interaction, f"/codex continue {task}", echo=True, preface=_preface,
             )
 
         @codex_group.command(name="status", description="查看 Codex 会话状态")
@@ -3874,12 +3893,15 @@ class DiscordAdapter(BasePlatformAdapter):
             # line above the dispatched task — displayed only, never a
             # search/filter dropdown. /claude continue always resumes the
             # currently-selected session, so there is nothing to pick. The
-            # preface is sent by _run_simple_slash *after* defer, so it can
-            # never blow the 3-second interaction deadline.
-            label = _claude_continue_context_label(interaction)
-            preface = f"> 📍 {label}" if label else None
+            # preface is a *callable* invoked by _run_simple_slash AFTER defer,
+            # so the (potentially blocking) registry read that builds the live
+            # label can never blow the 3-second interaction deadline.
+            def _preface() -> str:
+                label = _claude_continue_context_label(interaction)
+                return f"> 📍 {label}" if label else ""
+
             await self._run_simple_slash(
-                interaction, f"/claude continue {task}", echo=True, preface=preface,
+                interaction, f"/claude continue {task}", echo=True, preface=_preface,
             )
 
         @claude_group.command(name="status", description="查看 Claude 会话状态")
