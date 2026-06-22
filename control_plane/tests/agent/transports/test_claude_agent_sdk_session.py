@@ -4,8 +4,12 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from agent.transports.claude_agent_sdk_session import (
     ClaudeAgentSdkSession,
+    _hermes_can_use_tool,
+    _is_gateway_lifecycle_command,
     _parse_sdk_message,
     _redact_raw_line,
 )
@@ -354,3 +358,30 @@ def test_sdk_raw_tail_omits_thinking_delta_text() -> None:
     joined_tail = "\n".join(result.raw_output_tail)
     assert "private chain text" not in joined_tail
     assert "thinking_delta" in joined_tail
+
+
+def test_sdk_gateway_lifecycle_command_detection() -> None:
+    assert _is_gateway_lifecycle_command("systemctl --user restart hermes-gateway.service")
+    assert _is_gateway_lifecycle_command("hermes gateway restart")
+    assert _is_gateway_lifecycle_command("hermes update")
+    assert not _is_gateway_lifecycle_command("systemctl --user is-active hermes-gateway.service")
+    assert not _is_gateway_lifecycle_command("pytest -q")
+
+
+@pytest.mark.asyncio
+async def test_sdk_denies_gateway_restart_bash_tool() -> None:
+    result = await _hermes_can_use_tool(
+        "Bash",
+        {"command": "systemctl --user restart hermes-gateway.service"},
+        None,
+    )
+
+    assert result.behavior == "deny"
+    assert "last external step" in result.message
+
+
+@pytest.mark.asyncio
+async def test_sdk_allows_non_lifecycle_bash_tool() -> None:
+    result = await _hermes_can_use_tool("Bash", {"command": "pytest -q"}, None)
+
+    assert result.behavior == "allow"

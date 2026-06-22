@@ -18,6 +18,22 @@ from agent.transports.claude_runtime import TurnResult
 logger = logging.getLogger(__name__)
 
 _RESULT_GRACE_AFTER_ASSISTANT_END_TURN_SECONDS = 2.0
+_GATEWAY_LIFECYCLE_COMMAND_RE = re.compile(
+    r"("
+    r"\bsystemctl\s+--user\s+(restart|stop)\s+hermes-gateway\.service\b"
+    r"|\bhermes\s+gateway\s+(restart|stop)\b"
+    r"|\bhermes\s+update\b"
+    r")",
+    re.IGNORECASE,
+)
+_HERMES_RUNTIME_POLICY = (
+    "Hermes runtime policy: do not restart, stop, or update the Hermes gateway "
+    "from inside this Claude turn. Gateway lifecycle operations terminate the "
+    "process that is carrying this conversation. If deployment verification "
+    "requires a gateway restart, finish all edits, tests, and the final answer "
+    "first, then ask the operator or Hermes host to perform the restart as the "
+    "last external step."
+)
 
 
 class ClaudeAgentSdkRunner:
@@ -51,16 +67,24 @@ class ClaudeAgentSdkRunner:
                 "session_id": session_key,
             }
 
+        system_prompt = str(config.get("system_prompt") or "").strip()
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{_HERMES_RUNTIME_POLICY}"
+        else:
+            system_prompt = _HERMES_RUNTIME_POLICY
+
         options = ClaudeAgentOptions(
             cwd=cwd,
             model=model or config.get("model") or None,
             effort=effort or config.get("effort") or None,
+            system_prompt=system_prompt,
             permission_mode=permission_mode or None,
             resume=session_id or None,
             cli_path=config.get("cli_path") or None,
             env=env,
             include_partial_messages=True,
             include_hook_events=True,
+            can_use_tool=_hermes_can_use_tool,
         )
         client = ClaudeSDKClient(options=options)
         try:
@@ -398,6 +422,36 @@ class ClaudeAgentSdkSession:
         if "error" in result_box:
             raise result_box["error"]  # type: ignore[misc]
         return result_box.get("value")  # type: ignore[return-value]
+
+
+async def _hermes_can_use_tool(tool_name: str, tool_input: dict[str, Any], _context: Any):
+    try:
+        from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+    except Exception:  # pragma: no cover - only used with the SDK installed.
+        return None
+
+    command = _tool_command(tool_name, tool_input)
+    if command and _is_gateway_lifecycle_command(command):
+        return PermissionResultDeny(
+            message=(
+                "Hermes blocked this gateway lifecycle command because it would "
+                "terminate the running Claude turn. Finish the task and final "
+                "response first; perform the gateway restart as the last external step."
+            ),
+            interrupt=False,
+        )
+    return PermissionResultAllow()
+
+
+def _tool_command(tool_name: str, tool_input: dict[str, Any]) -> str:
+    if str(tool_name or "").lower() != "bash":
+        return ""
+    command = tool_input.get("command") if isinstance(tool_input, dict) else ""
+    return command if isinstance(command, str) else ""
+
+
+def _is_gateway_lifecycle_command(command: str) -> bool:
+    return bool(_GATEWAY_LIFECYCLE_COMMAND_RE.search(command or ""))
 
 
 class _ParsedSdkMessage:
