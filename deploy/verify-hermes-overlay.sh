@@ -50,7 +50,10 @@ fi
 required=(
   "gateway/control_planes/codex/service.py"
   "gateway/control_planes/codex/repair.py"
+  "gateway/control_planes/claude/service.py"
+  "gateway/control_planes/claude/narrator.py"
   "agent/transports/codex_app_server_session.py"
+  "agent/transports/claude_cli_session.py"
   "gateway/slash_commands.py"
   "plugins/platforms/discord/adapter.py"
   "tools/approval.py"
@@ -66,8 +69,10 @@ done
 mapfile -t py_files < <(
   {
     find "$hermes_agent/gateway/control_planes/codex" -type f -name '*.py'
+    find "$hermes_agent/gateway/control_planes/claude" -type f -name '*.py'
     printf '%s\n' \
       "$hermes_agent/agent/transports/codex_app_server_session.py" \
+      "$hermes_agent/agent/transports/claude_cli_session.py" \
       "$hermes_agent/gateway/slash_commands.py" \
       "$hermes_agent/gateway/run.py" \
       "$hermes_agent/gateway/platforms/api_server.py" \
@@ -85,6 +90,8 @@ if [[ -x "$hermes_agent/venv/bin/python" ]]; then
     "$python_bin" -m pytest \
       tests/gateway/test_codex_command_service.py \
       tests/gateway/test_codex_control_architecture.py \
+      tests/gateway/test_claude_command_service.py \
+      tests/gateway/test_claude_control_architecture.py \
       tests/agent/transports/test_codex_app_server_session.py \
       tests/gateway/test_discord_slash_commands.py \
       -q

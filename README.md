@@ -1,22 +1,23 @@
 # HAgent Code
 
-Small, self-contained project for running Codex from Hermes without vendoring
-the whole Hermes repository.
+Small, self-contained project for running Codex and Claude Code from Hermes
+without vendoring the whole Hermes repository.
 
 ## Layout
 
 ```text
-control_plane/                 # platform-neutral /codex service
+control_plane/                 # platform-neutral /codex and /claude services
 hermes_overlay/                # files copied into a Hermes checkout
 deploy/                        # install and verification scripts
 ```
 
-`control_plane/` contains the reusable Codex command core.  It has no Discord
-or Telegram adapter dependency.
+`control_plane/` contains the reusable Codex and Claude command cores.  They
+have no Discord or Telegram adapter dependency.
 
 `hermes_overlay/` contains the Hermes integration files that make the control
-plane work in a real gateway: app-server transport, slash-command integration,
-Discord native commands, approval bridge, and focused tests.
+planes work in a real gateway: app-server / CLI transports, slash-command
+integration, Discord native commands, approval bridge, skills, and focused
+tests.
 
 Secrets, local state, `.git`, caches, and the rest of Hermes are intentionally
 not part of this repository.

@@ -7511,6 +7511,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "codex":
             return await self._handle_codex_command(event)
 
+        if canonical == "claude":
+            return await self._handle_claude_command(event)
+
         if canonical == "personality":
             return await self._handle_personality_command(event)
 

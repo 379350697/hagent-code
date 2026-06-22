@@ -1691,6 +1691,156 @@ class GatewaySlashCommandsMixin:
         result = await get_codex_command_service().handle(request)
         return result.text
 
+    async def _handle_claude_command(self, event: MessageEvent) -> str:
+        """Handle /claude task-control commands via the platform-neutral service."""
+        from gateway.control_planes.claude import (
+            CommandRequest as ClaudeCommandRequest,
+            get_claude_command_service,
+        )
+
+        source = event.source if event else None
+        platform = source.platform.value if source and source.platform else "unknown"
+        adapter = self.adapters.get(source.platform) if source and getattr(self, "adapters", None) else None
+        approval_session_key = self._session_key_for_source(source) if source else ""
+        approval_chat_id = str(getattr(source, "chat_id", "") or "")
+        approval_metadata = (
+            self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+            if source
+            else None
+        ) or {}
+        is_admin = False
+        if source is not None:
+            try:
+                from gateway.slash_access import policy_for_source as _policy_for_source
+
+                policy = _policy_for_source(self.config, source)
+                is_admin = bool(policy.enabled and policy.is_admin(source.user_id))
+            except Exception:
+                logger.debug("Could not resolve /claude admin policy", exc_info=True)
+        loop = asyncio.get_running_loop()
+
+        def _claude_approval_notify(approval_data: dict) -> None:
+            if adapter is None or not approval_chat_id:
+                raise RuntimeError("Claude 审批通道不可用：当前平台没有可用适配器")
+
+            async def _send_approval() -> None:
+                command = str(approval_data.get("command") or "")
+                description = str(
+                    approval_data.get("description") or "Claude 请求审批"
+                )
+                if hasattr(adapter, "pause_typing_for_chat"):
+                    try:
+                        adapter.pause_typing_for_chat(approval_chat_id)
+                    except Exception:
+                        logger.debug("pause_typing_for_chat failed", exc_info=True)
+
+                if getattr(type(adapter), "send_exec_approval", None) is not None:
+                    result = await adapter.send_exec_approval(
+                        chat_id=approval_chat_id,
+                        command=command,
+                        session_key=approval_session_key,
+                        description=description,
+                        metadata=approval_metadata,
+                    )
+                    if getattr(result, "success", False):
+                        return
+                    logger.warning(
+                        "Claude approval button send failed, falling back to text: %s",
+                        getattr(result, "error", ""),
+                    )
+
+                prefix = getattr(adapter, "typed_command_prefix", "/")
+                preview = command[:200] + "..." if len(command) > 200 else command
+                message = (
+                    "⚠️ **Claude 需要审批**\n"
+                    f"```\n{preview}\n```\n"
+                    f"原因：{description}\n\n"
+                    f"回复 `{prefix}approve` 允许一次，"
+                    f"`{prefix}approve session` 允许本会话，"
+                    f"或 `{prefix}deny` 拒绝。"
+                )
+                send_result = await adapter.send(
+                    approval_chat_id,
+                    message,
+                    metadata=approval_metadata,
+                )
+                if not getattr(send_result, "success", False):
+                    raise RuntimeError(
+                        f"Claude 审批通道不可用：{getattr(send_result, 'error', '')}"
+                    )
+
+            future = asyncio.run_coroutine_threadsafe(_send_approval(), loop)
+            future.result(timeout=15)
+
+        progress_message_id = None
+
+        def _claude_progress_notify(progress_data: dict) -> None:
+            if adapter is None or not approval_chat_id:
+                return
+
+            async def _send_progress() -> None:
+                nonlocal progress_message_id
+                text = str(progress_data.get("text") or "").strip()
+                if not text:
+                    return
+                send_result = None
+                if progress_message_id:
+                    try:
+                        send_result = await adapter.edit_message(
+                            approval_chat_id,
+                            progress_message_id,
+                            text,
+                            finalize=False,
+                        )
+                    except Exception:
+                        logger.debug("Claude progress edit failed", exc_info=True)
+                        send_result = None
+                if not getattr(send_result, "success", False):
+                    send_result = await adapter.send(
+                        approval_chat_id,
+                        text,
+                        metadata=approval_metadata,
+                    )
+                    if getattr(send_result, "success", False) and getattr(send_result, "message_id", None):
+                        progress_message_id = str(send_result.message_id)
+                if not getattr(send_result, "success", False):
+                    logger.debug(
+                        "Claude progress delivery failed: %s",
+                        getattr(send_result, "error", ""),
+                    )
+
+            future = asyncio.run_coroutine_threadsafe(_send_progress(), loop)
+
+            def _log_progress_failure(done) -> None:
+                try:
+                    exc = done.exception()
+                except Exception as err:
+                    exc = err
+                if exc is not None:
+                    logger.debug(
+                        "Claude progress notify failed",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+
+            future.add_done_callback(_log_progress_failure)
+
+        request = ClaudeCommandRequest(
+            platform=platform,
+            chat_id=str(getattr(source, "chat_id", "") or ""),
+            user_id=str(getattr(source, "user_id", "") or ""),
+            thread_id=str(getattr(source, "thread_id", "") or ""),
+            text=event.get_command_args().strip() if event else "",
+            workspace=getattr(self, "working_directory", None) or os.getcwd(),
+            approval_session_key=approval_session_key,
+            approval_chat_id=approval_chat_id,
+            approval_thread_metadata=approval_metadata,
+            approval_notify=_claude_approval_notify if adapter is not None else None,
+            progress_notify=_claude_progress_notify if adapter is not None else None,
+            is_admin=is_admin,
+        )
+        result = await get_claude_command_service().handle(request)
+        return result.text
+
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
         from gateway.run import _hermes_home, _load_gateway_config

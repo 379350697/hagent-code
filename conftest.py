@@ -50,11 +50,28 @@ _prepend_package_path(
     "gateway.control_planes",
     ROOT / "control_plane" / "gateway" / "control_planes",
 )
+# Allow ``gateway.control_planes.claude`` to resolve to this checkout's
+# overlay copy before any installed Hermes copy, mirroring the codex overlay.
+_prepend_package_path(
+    "gateway.control_planes.claude",
+    ROOT / "control_plane" / "gateway" / "control_planes" / "claude",
+)
 _prepend_package_path("agent", ROOT / "hermes_overlay" / "agent")
 _prepend_package_path(
     "agent.transports",
     ROOT / "hermes_overlay" / "agent" / "transports",
 )
+_prepend_package_path(
+    "plugins.platforms.discord",
+    ROOT / "hermes_overlay" / "plugins" / "platforms" / "discord",
+)
+# The installed discord plugin package imports ``.adapter`` from its
+# ``__init__``. Drop that cached submodule after extending the package path so
+# tests import this checkout's overlay adapter instead.
+sys.modules.pop("plugins.platforms.discord.adapter", None)
+_discord_pkg = sys.modules.get("plugins.platforms.discord")
+if _discord_pkg is not None and hasattr(_discord_pkg, "adapter"):
+    delattr(_discord_pkg, "adapter")
 
 _prepend_sys_path(ROOT / "control_plane")
 _prepend_sys_path(ROOT / "hermes_overlay")

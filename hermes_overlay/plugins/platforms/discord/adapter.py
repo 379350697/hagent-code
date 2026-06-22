@@ -3818,6 +3818,249 @@ class DiscordAdapter(BasePlatformAdapter):
 
         tree.add_command(codex_group)
 
+        # ── /claude command group with subcommands ─────────────────────
+        # Keep the Discord native shape aligned with the platform-neutral
+        # service: /claude new <task>, /claude continue <task>, etc.
+        try:
+            tree.remove_command("claude")
+        except Exception:
+            pass
+
+        claude_group = discord.app_commands.Group(
+            name="claude",
+            description="Claude Code 任务控制",
+        )
+
+        @claude_group.command(name="new", description="新开 Claude 任务")
+        @discord.app_commands.describe(task="任务描述")
+        async def _claude_new(interaction: discord.Interaction, task: str):
+            await self._run_simple_slash(interaction, f"/claude new {task}", echo=True)
+
+        async def _claude_continue_task_autocomplete(
+            interaction: "discord.Interaction", current: str,
+        ) -> list:
+            try:
+                allowed, _reason = self._evaluate_slash_authorization(interaction)
+            except Exception:
+                return []
+            if not allowed:
+                return []
+            try:
+                from gateway.control_planes.claude import (
+                    CommandRequest,
+                    build_claude_task_key,
+                    get_claude_command_service,
+                )
+
+                is_thread = isinstance(interaction.channel, discord.Thread)
+                request = CommandRequest(
+                    platform="discord",
+                    chat_id=str(interaction.channel_id),
+                    thread_id=str(interaction.channel_id) if is_thread else "",
+                )
+                service = get_claude_command_service()
+                task_key = build_claude_task_key(request)
+                record = service._selected_or_latest_record(task_key)  # type: ignore[attr-defined]
+                if record is None:
+                    label = "当前：没有选中的 Claude 会话，建议先用 /claude new"
+                else:
+                    workspace = service._workspace_label(  # type: ignore[attr-defined]
+                        str(getattr(record, "workspace", "") or "")
+                    )
+                    title = service._session_title(record)  # type: ignore[attr-defined]
+                    label = f"当前：{workspace} · {title}"
+            except Exception:
+                logger.debug("[%s] Failed to build Claude continue context", self.name, exc_info=True)
+                return []
+
+            suffix = "；直接输入你的继续要求"
+            name = f"{label}{suffix}"
+            if len(name) > 100:
+                name = name[:97] + "..."
+            value = (current or "").strip()
+            if not value:
+                value = "在这里输入继续要求"
+            if len(value) > 100:
+                value = value[:100]
+            return [discord.app_commands.Choice(name=name, value=value)]
+
+        @claude_group.command(name="continue", description="继续当前 Claude 会话")
+        @discord.app_commands.describe(task="继续要求（输入时会提示当前工作区和会话）")
+        @discord.app_commands.autocomplete(task=_claude_continue_task_autocomplete)
+        async def _claude_continue(interaction: discord.Interaction, task: str):
+            await self._run_simple_slash(interaction, f"/claude continue {task}", echo=True)
+
+        @claude_group.command(name="status", description="查看 Claude 会话状态")
+        async def _claude_status(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude status", echo=True)
+
+        @claude_group.command(name="sessions", description="列出近期 Claude 会话")
+        async def _claude_sessions(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude sessions", echo=True)
+
+        @claude_group.command(name="events", description="查看当前 Claude 会话事件")
+        async def _claude_events(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude events", echo=True)
+
+        @claude_group.command(name="doctor", description="诊断 Claude Code CLI 链路")
+        async def _claude_doctor(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude doctor", echo=True)
+
+        async def _claude_session_autocomplete(
+            interaction: "discord.Interaction", current: str,
+        ) -> list:
+            try:
+                allowed, _reason = self._evaluate_slash_authorization(interaction)
+            except Exception:
+                return []
+            if not allowed:
+                return []
+            try:
+                from gateway.control_planes.claude import (
+                    CommandRequest,
+                    build_claude_task_key,
+                    get_claude_command_service,
+                )
+
+                is_thread = isinstance(interaction.channel, discord.Thread)
+                request = CommandRequest(
+                    platform="discord",
+                    chat_id=str(interaction.channel_id),
+                    thread_id=str(interaction.channel_id) if is_thread else "",
+                )
+                service = get_claude_command_service()
+                task_key = build_claude_task_key(request)
+                records = service._session_records_for_request(  # type: ignore[attr-defined]
+                    request,
+                    task_key,
+                    limit=50,
+                )
+            except Exception:
+                logger.debug("[%s] Failed to build Claude session autocomplete", self.name, exc_info=True)
+                return []
+
+            query = (current or "").strip().lower()
+            choices: list = []
+            for index, record in enumerate(records, start=1):
+                task_id = str(getattr(record, "task_id", "") or "")
+                thread_id = str(getattr(record, "thread_id", "") or "")
+                workspace = str(getattr(record, "workspace", "") or "").rstrip(os.sep)
+                project = os.path.basename(workspace) if workspace else "unknown"
+                title = str(getattr(record, "title", "") or "(untitled)")
+                haystack = f"{index} {task_id} {thread_id} {project} {workspace} {title}".lower()
+                if query and query not in haystack:
+                    continue
+                label = f"{index}. {project} · {task_id} · {title}"
+                if len(label) > 100:
+                    label = label[:97] + "..."
+                choices.append(discord.app_commands.Choice(name=label, value=str(index)))
+                if len(choices) >= 25:
+                    break
+            return choices
+
+        @claude_group.command(name="select", description="选择历史 Claude 会话")
+        @discord.app_commands.describe(session="历史会话")
+        @discord.app_commands.autocomplete(session=_claude_session_autocomplete)
+        async def _claude_select(interaction: discord.Interaction, session: str):
+            await self._run_simple_slash(interaction, f"/claude select {session}", echo=True)
+
+        @claude_group.command(name="resume", description="接续指定历史 Claude 会话")
+        @discord.app_commands.describe(session="历史会话", task="任务描述")
+        @discord.app_commands.autocomplete(session=_claude_session_autocomplete)
+        async def _claude_resume(interaction: discord.Interaction, session: str, task: str):
+            await self._run_simple_slash(interaction, f"/claude resume {session} {task}", echo=True)
+
+        claude_workspace_group = discord.app_commands.Group(
+            name="workspace",
+            description="选择或查看 Claude 工作区",
+        )
+
+        async def _claude_workspace_autocomplete(
+            interaction: "discord.Interaction", current: str,
+        ) -> list:
+            try:
+                allowed, _reason = self._evaluate_slash_authorization(interaction)
+            except Exception:
+                return []
+            if not allowed:
+                return []
+            try:
+                from gateway.control_planes.claude.workspaces import (
+                    discover_git_workspaces,
+                    workspace_scan_roots,
+                )
+
+                default_workspace = os.environ.get("HERMES_HOME") or os.getcwd()
+                entries = discover_git_workspaces(workspace_scan_roots(default_workspace))
+            except Exception:
+                logger.debug("[%s] Failed to build Claude workspace autocomplete", self.name, exc_info=True)
+                return []
+
+            query = (current or "").strip().lower()
+            choices: list = []
+            for index, entry in enumerate(entries, start=1):
+                haystack = f"{entry.name} {entry.path}".lower()
+                if query and query not in haystack:
+                    continue
+                label = f"{index}. {entry.name} — {entry.path}"
+                if len(label) > 100:
+                    label = label[:97] + "..."
+                choices.append(discord.app_commands.Choice(name=label, value=str(index)))
+                if len(choices) >= 25:
+                    break
+            return choices
+
+        @claude_workspace_group.command(name="list", description="列出本机 Git 工作区")
+        async def _claude_workspace_list(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude workspace list", echo=True)
+
+        @claude_workspace_group.command(name="current", description="查看当前 Claude 工作区")
+        async def _claude_workspace_current(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude workspace current", echo=True)
+
+        @claude_workspace_group.command(name="set", description="选择 Claude 工作区")
+        @discord.app_commands.describe(repo="Git 仓库项目")
+        @discord.app_commands.autocomplete(repo=_claude_workspace_autocomplete)
+        async def _claude_workspace_set(interaction: discord.Interaction, repo: str):
+            await self._run_simple_slash(interaction, f"/claude workspace set {repo}", echo=True)
+
+        @claude_workspace_group.command(name="clear", description="清除当前 Claude 工作区选择")
+        async def _claude_workspace_clear(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude workspace clear", echo=True)
+
+        claude_group.add_command(claude_workspace_group)
+
+        @claude_group.command(name="diff", description="查看上次 Claude 任务的 git 改动")
+        async def _claude_diff(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude diff", echo=True)
+
+        @claude_group.command(name="stop", description="中断正在执行的 Claude 任务")
+        async def _claude_stop(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/claude stop", echo=True)
+
+        @claude_group.command(name="steer", description="查看 Claude 运行中补充指令限制")
+        @discord.app_commands.describe(text="要补充的指令")
+        async def _claude_steer(interaction: discord.Interaction, text: str):
+            await self._run_simple_slash(interaction, f"/claude steer {text}", echo=True)
+
+        @claude_group.command(name="plan", description="以计划模式启动 Claude 任务")
+        @discord.app_commands.describe(task="任务描述")
+        async def _claude_plan(interaction: discord.Interaction, task: str):
+            await self._run_simple_slash(interaction, f"/claude plan {task}", echo=True)
+
+        @claude_group.command(name="permissions", description="设置 Claude 权限模式")
+        @discord.app_commands.describe(mode="选择权限模式")
+        @discord.app_commands.choices(mode=[
+            discord.app_commands.Choice(name="Default（Claude 默认权限）", value="default"),
+            discord.app_commands.Choice(name="Approve for me（自动审批）", value="approve-for-me"),
+            discord.app_commands.Choice(name="Read Only（只读）", value="read-only"),
+            discord.app_commands.Choice(name="Full Access（全权限）", value="full-access"),
+        ])
+        async def _claude_permissions(interaction: discord.Interaction, mode: str):
+            await self._run_simple_slash(interaction, f"/claude permissions {mode}", echo=True)
+
+        tree.add_command(claude_group)
+
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash
@@ -3867,6 +4110,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 already_registered = {cmd.name for cmd in tree.get_commands()}
             except Exception:
                 pass
+            # These are hand-registered native groups above. Keep them out of
+            # COMMAND_REGISTRY auto-registration even if a test or adapter tree
+            # implementation reports an incomplete command snapshot.
+            already_registered.update({"codex", "claude"})
 
             config_overrides = _resolve_config_gates()
 

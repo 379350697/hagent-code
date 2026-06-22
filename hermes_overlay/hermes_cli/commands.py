@@ -130,6 +130,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[auto|codex_app_server]"),
     CommandDef("codex", "Control Codex app-server tasks", "Tools & Skills",
                args_hint="[new|continue|status|sessions|diff|stop|steer|plan|permissions]"),
+    CommandDef("claude", "Control Claude Code CLI tasks", "Tools & Skills",
+               args_hint="[new|continue|status|sessions|diff|stop|plan|permissions]"),
     CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info",
                cli_only=True),
 
@@ -1057,7 +1059,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
 #   - codex: long-task controls are still available as /hermes codex ... on
 #     Slack, preserving scarce native slash slots for established commands.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "codex"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "codex", "claude"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

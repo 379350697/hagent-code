@@ -11,10 +11,6 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_discord_mock():
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
-        # Real discord is installed — nothing to do.
-        return
-
     def _fake_autocomplete(**kwargs):
         def decorator(fn):
             existing = dict(getattr(fn, "__autocomplete__", {}) or {})
@@ -24,65 +20,64 @@ def _ensure_discord_mock():
 
         return decorator
 
-    if sys.modules.get("discord") is None:
-        discord_mod = MagicMock()
-        discord_mod.Intents.default.return_value = MagicMock()
-        discord_mod.DMChannel = type("DMChannel", (), {})
-        discord_mod.Thread = type("Thread", (), {})
-        discord_mod.ForumChannel = type("ForumChannel", (), {})
-        discord_mod.Interaction = object
+    discord_mod = MagicMock()
+    discord_mod.Intents.default.return_value = MagicMock()
+    discord_mod.DMChannel = type("DMChannel", (), {})
+    discord_mod.Thread = type("Thread", (), {})
+    discord_mod.ForumChannel = type("ForumChannel", (), {})
+    discord_mod.Interaction = object
 
-        # Lightweight mock for app_commands.Group and Command used by
-        # _register_skill_group.
-        class _FakeGroup:
-            def __init__(self, *, name, description, parent=None):
-                self.name = name
-                self.description = description
-                self.parent = parent
-                self._children: dict[str, object] = {}
-                if parent is not None:
-                    parent.add_command(self)
+    # Lightweight mock for app_commands.Group and Command used by
+    # _register_skill_group.
+    class _FakeGroup:
+        def __init__(self, *, name, description, parent=None):
+            self.name = name
+            self.description = description
+            self.parent = parent
+            self._children: dict[str, object] = {}
+            if parent is not None:
+                parent.add_command(self)
 
-            def add_command(self, cmd):
-                self._children[cmd.name] = cmd
+        def add_command(self, cmd):
+            self._children[cmd.name] = cmd
 
-            def command(self, *, name, description):
-                def decorator(fn):
-                    self.add_command(_FakeCommand(
-                        name=name,
-                        description=description,
-                        callback=fn,
-                        parent=self,
-                    ))
-                    return fn
+        def command(self, *, name, description):
+            def decorator(fn):
+                self.add_command(_FakeCommand(
+                    name=name,
+                    description=description,
+                    callback=fn,
+                    parent=self,
+                ))
+                return fn
 
-                return decorator
+            return decorator
 
-        class _FakeCommand:
-            def __init__(self, *, name, description, callback, parent=None):
-                self.name = name
-                self.description = description
-                self.callback = callback
-                self.parent = parent
-                self.autocomplete = getattr(callback, "__autocomplete__", {})
+    class _FakeCommand:
+        def __init__(self, *, name, description, callback, parent=None):
+            self.name = name
+            self.description = description
+            self.callback = callback
+            self.parent = parent
+            self.autocomplete = getattr(callback, "__autocomplete__", {})
 
-        discord_mod.app_commands = SimpleNamespace(
-            describe=lambda **kwargs: (lambda fn: fn),
-            choices=lambda **kwargs: (lambda fn: fn),
-            autocomplete=_fake_autocomplete,
-            Choice=lambda **kwargs: SimpleNamespace(**kwargs),
-            Group=_FakeGroup,
-            Command=_FakeCommand,
-        )
+    discord_mod.app_commands = SimpleNamespace(
+        describe=lambda **kwargs: (lambda fn: fn),
+        choices=lambda **kwargs: (lambda fn: fn),
+        autocomplete=_fake_autocomplete,
+        Choice=lambda **kwargs: SimpleNamespace(**kwargs),
+        Group=_FakeGroup,
+        Command=_FakeCommand,
+    )
 
-        ext_mod = MagicMock()
-        commands_mod = MagicMock()
-        commands_mod.Bot = MagicMock
-        ext_mod.commands = commands_mod
+    ext_mod = MagicMock()
+    commands_mod = MagicMock()
+    commands_mod.Bot = MagicMock
+    ext_mod.commands = commands_mod
 
-        sys.modules["discord"] = discord_mod
-        sys.modules.setdefault("discord.ext", ext_mod)
-        sys.modules.setdefault("discord.ext.commands", commands_mod)
+    sys.modules["discord"] = discord_mod
+    sys.modules["discord.ext"] = ext_mod
+    sys.modules["discord.ext.commands"] = commands_mod
 
     # Whether we just installed the mock OR another test module installed
     # it first via its own _ensure_discord_mock, force the decorators we
@@ -218,6 +213,62 @@ def test_codex_workspace_uses_native_subcommands(adapter):
     assert "repo" in signature.parameters
 
 
+def test_claude_uses_native_subcommands(adapter):
+    adapter._register_slash_commands()
+
+    claude = adapter._client.tree.commands["claude"]
+    claude_children = getattr(claude, "_children", {})
+    workspace = claude_children["workspace"]
+    workspace_children = getattr(workspace, "_children", {})
+
+    assert {
+        "new",
+        "continue",
+        "status",
+        "sessions",
+        "events",
+        "doctor",
+        "select",
+        "resume",
+        "workspace",
+        "diff",
+        "stop",
+        "steer",
+        "plan",
+        "permissions",
+    } <= set(claude_children)
+    assert {"list", "current", "set", "clear"} <= set(workspace_children)
+
+    assert "args" not in inspect.signature(claude_children["new"].callback).parameters
+    assert "task" in inspect.signature(claude_children["new"].callback).parameters
+    assert "task" in inspect.signature(claude_children["continue"].callback).parameters
+    assert "repo" in inspect.signature(workspace_children["set"].callback).parameters
+
+
+@pytest.mark.asyncio
+async def test_claude_new_and_continue_dispatch_canonical_usage(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    claude = adapter._client.tree.commands["claude"]
+    claude_children = getattr(claude, "_children", {})
+    interaction = SimpleNamespace()
+
+    await claude_children["new"].callback(interaction, task="fix discord menu")
+    await claude_children["continue"].callback(interaction, task="ship the follow-up")
+
+    assert adapter._run_simple_slash.await_args_list[0].args == (
+        interaction,
+        "/claude new fix discord menu",
+    )
+    assert adapter._run_simple_slash.await_args_list[0].kwargs == {"echo": True}
+    assert adapter._run_simple_slash.await_args_list[1].args == (
+        interaction,
+        "/claude continue ship the follow-up",
+    )
+    assert adapter._run_simple_slash.await_args_list[1].kwargs == {"echo": True}
+
+
 @pytest.mark.asyncio
 async def test_simple_slash_defer_failure_does_not_dispatch(adapter):
     class UnknownInteraction(Exception):
@@ -297,6 +348,47 @@ async def test_codex_continue_autocomplete_shows_current_session_context(adapter
     assert "当前：wlcodex" in choices[0].name
     assert "看下 web 模式会话流是否真实流式" in choices[0].name
     assert choices[0].value == "继续执行"
+
+
+@pytest.mark.asyncio
+async def test_claude_continue_autocomplete_shows_current_session_context(adapter, monkeypatch):
+    from gateway.control_planes import claude as claude_pkg
+
+    record = SimpleNamespace(
+        workspace="/home/wl/projects/hagent-code",
+        title="检查 Discord 注册菜单",
+    )
+
+    class FakeService:
+        def _selected_or_latest_record(self, task_key):
+            assert task_key == "discord:42:main"
+            return record
+
+        @staticmethod
+        def _workspace_label(workspace):
+            return workspace.rstrip("/").split("/")[-1]
+
+        @staticmethod
+        def _session_title(record):
+            return record.title
+
+    monkeypatch.setattr(claude_pkg, "get_claude_command_service", lambda: FakeService())
+    adapter._register_slash_commands()
+
+    claude = adapter._client.tree.commands["claude"]
+    continue_cmd = getattr(claude, "_children", {})["continue"]
+    autocomplete = getattr(continue_cmd, "autocomplete", {})["task"]
+    interaction = SimpleNamespace(
+        channel=SimpleNamespace(id=42),
+        channel_id=42,
+    )
+
+    choices = await autocomplete(interaction, "继续修")
+
+    assert len(choices) == 1
+    assert "当前：hagent-code" in choices[0].name
+    assert "检查 Discord 注册菜单" in choices[0].name
+    assert choices[0].value == "继续修"
 
 
 # ------------------------------------------------------------------

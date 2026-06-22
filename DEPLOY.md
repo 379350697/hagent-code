@@ -66,6 +66,10 @@ Then validate from Discord or Telegram:
 /codex doctor
 /codex status
 /codex continue <task>
+
+/claude doctor
+/claude status
+/claude continue <task>
 ```
 
 Discord slash commands may require a client refresh or guild command sync before
