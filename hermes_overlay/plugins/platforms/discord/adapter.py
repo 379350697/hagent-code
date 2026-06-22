@@ -3603,9 +3603,51 @@ class DiscordAdapter(BasePlatformAdapter):
         async def _codex_new(interaction: discord.Interaction, task: str):
             await self._run_simple_slash(interaction, f"/codex new {task}", echo=True)
 
+        def _codex_continue_context_label(interaction: "discord.Interaction") -> str:
+            try:
+                from gateway.control_planes.codex import (
+                    CommandRequest,
+                    build_codex_task_key,
+                    get_codex_command_service,
+                )
+
+                is_thread = isinstance(interaction.channel, discord.Thread)
+                request = CommandRequest(
+                    platform="discord",
+                    chat_id=str(interaction.channel_id),
+                    thread_id=str(interaction.channel_id) if is_thread else "",
+                )
+                service = get_codex_command_service()
+                task_key = build_codex_task_key(request)
+                record = service._selected_or_latest_record(task_key)  # type: ignore[attr-defined]
+                if record is None:
+                    return ""
+                workspace = service._workspace_label(  # type: ignore[attr-defined]
+                    str(getattr(record, "workspace", "") or "")
+                )
+                title = service._session_title(record)  # type: ignore[attr-defined]
+                return f"当前：{workspace} · {title}"
+            except Exception:
+                logger.debug("[%s] Failed to build Codex continue context", self.name, exc_info=True)
+                return ""
+
+        async def _codex_continue_task_autocomplete(
+            interaction: "discord.Interaction",
+            current: str,
+        ):
+            label = _codex_continue_context_label(interaction)
+            if not label:
+                return []
+            value = current[:100] if str(current or "").strip() else "__hermes_continue_context_hint__"
+            return [discord.app_commands.Choice(name=f"📍 {label}"[:100], value=value)]
+
         @codex_group.command(name="continue", description="继续当前 Codex 会话")
-        @discord.app_commands.describe(task="📍 当前：工作区 · 会话标题")
+        @discord.app_commands.describe(task="继续要求（直接输入；候选提示显示当前会话）")
+        @discord.app_commands.autocomplete(task=_codex_continue_task_autocomplete)
         async def _codex_continue(interaction: discord.Interaction, task: str):
+            if task == "__hermes_continue_context_hint__":
+                await interaction.response.send_message("请直接在 task 里输入继续要求，不需要选择提示项。", ephemeral=True)
+                return
             await self._run_simple_slash(interaction, f"/codex continue {task}", echo=True)
 
         @codex_group.command(name="status", description="查看 Codex 会话状态")
@@ -3801,9 +3843,51 @@ class DiscordAdapter(BasePlatformAdapter):
         async def _claude_new(interaction: discord.Interaction, task: str):
             await self._run_simple_slash(interaction, f"/claude new {task}", echo=True)
 
+        def _claude_continue_context_label(interaction: "discord.Interaction") -> str:
+            try:
+                from gateway.control_planes.claude import (
+                    CommandRequest,
+                    build_claude_task_key,
+                    get_claude_command_service,
+                )
+
+                is_thread = isinstance(interaction.channel, discord.Thread)
+                request = CommandRequest(
+                    platform="discord",
+                    chat_id=str(interaction.channel_id),
+                    thread_id=str(interaction.channel_id) if is_thread else "",
+                )
+                service = get_claude_command_service()
+                task_key = build_claude_task_key(request)
+                record = service._selected_or_latest_record(task_key)  # type: ignore[attr-defined]
+                if record is None:
+                    return ""
+                workspace = service._workspace_label(  # type: ignore[attr-defined]
+                    str(getattr(record, "workspace", "") or "")
+                )
+                title = service._session_title(record)  # type: ignore[attr-defined]
+                return f"当前：{workspace} · {title}"
+            except Exception:
+                logger.debug("[%s] Failed to build Claude continue context", self.name, exc_info=True)
+                return ""
+
+        async def _claude_continue_task_autocomplete(
+            interaction: "discord.Interaction",
+            current: str,
+        ):
+            label = _claude_continue_context_label(interaction)
+            if not label:
+                return []
+            value = current[:100] if str(current or "").strip() else "__hermes_continue_context_hint__"
+            return [discord.app_commands.Choice(name=f"📍 {label}"[:100], value=value)]
+
         @claude_group.command(name="continue", description="继续当前 Claude 会话")
-        @discord.app_commands.describe(task="📍 当前：工作区 · 会话标题")
+        @discord.app_commands.describe(task="继续要求（直接输入；候选提示显示当前会话）")
+        @discord.app_commands.autocomplete(task=_claude_continue_task_autocomplete)
         async def _claude_continue(interaction: discord.Interaction, task: str):
+            if task == "__hermes_continue_context_hint__":
+                await interaction.response.send_message("请直接在 task 里输入继续要求，不需要选择提示项。", ephemeral=True)
+                return
             await self._run_simple_slash(interaction, f"/claude continue {task}", echo=True)
 
         @claude_group.command(name="status", description="查看 Claude 会话状态")

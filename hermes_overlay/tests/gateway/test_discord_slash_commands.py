@@ -364,19 +364,44 @@ async def test_codex_registers_diagnostics_subcommands(adapter):
 
 
 @pytest.mark.asyncio
-async def test_codex_continue_prompt_uses_context_description_without_preface(adapter):
+async def test_codex_continue_autocomplete_shows_real_context_without_preface(adapter, monkeypatch):
+    from gateway.control_planes import codex as codex_pkg
+
+    record = SimpleNamespace(
+        workspace="/home/wl/projects/wlcodex",
+        title="看下 web 模式会话流是否真实流式",
+    )
+
+    class FakeService:
+        def _selected_or_latest_record(self, task_key):
+            assert task_key == "discord:42:main"
+            return record
+
+        @staticmethod
+        def _workspace_label(workspace):
+            return workspace.rstrip("/").split("/")[-1]
+
+        @staticmethod
+        def _session_title(record):
+            return record.title
+
+    monkeypatch.setattr(codex_pkg, "get_codex_command_service", lambda: FakeService())
     adapter._run_simple_slash = AsyncMock()
     adapter._register_slash_commands()
 
     codex = adapter._client.tree.commands["codex"]
     continue_cmd = getattr(codex, "_children", {})["continue"]
 
-    assert continue_cmd.descriptions["task"] == "📍 当前：工作区 · 会话标题"
-    assert not getattr(continue_cmd, "autocomplete", {})
-
+    assert continue_cmd.descriptions["task"] == "继续要求（直接输入；候选提示显示当前会话）"
+    autocomplete = continue_cmd.autocomplete["task"]
     interaction = SimpleNamespace(channel=SimpleNamespace(id=42), channel_id=42)
-    await continue_cmd.callback(interaction, task="继续执行")
+    choices = await autocomplete(interaction, "继续执行")
 
+    assert len(choices) == 1
+    assert choices[0].name == "📍 当前：wlcodex · 看下 web 模式会话流是否真实流式"
+    assert choices[0].value == "继续执行"
+
+    await continue_cmd.callback(interaction, task="继续执行")
     adapter._run_simple_slash.assert_awaited_once_with(
         interaction,
         "/codex continue 继续执行",
@@ -385,19 +410,44 @@ async def test_codex_continue_prompt_uses_context_description_without_preface(ad
 
 
 @pytest.mark.asyncio
-async def test_claude_continue_prompt_uses_context_description_without_preface(adapter):
+async def test_claude_continue_autocomplete_shows_real_context_without_preface(adapter, monkeypatch):
+    from gateway.control_planes import claude as claude_pkg
+
+    record = SimpleNamespace(
+        workspace="/home/wl/projects/hagent-code",
+        title="检查 Discord 注册菜单",
+    )
+
+    class FakeService:
+        def _selected_or_latest_record(self, task_key):
+            assert task_key == "discord:42:main"
+            return record
+
+        @staticmethod
+        def _workspace_label(workspace):
+            return workspace.rstrip("/").split("/")[-1]
+
+        @staticmethod
+        def _session_title(record):
+            return record.title
+
+    monkeypatch.setattr(claude_pkg, "get_claude_command_service", lambda: FakeService())
     adapter._run_simple_slash = AsyncMock()
     adapter._register_slash_commands()
 
     claude = adapter._client.tree.commands["claude"]
     continue_cmd = getattr(claude, "_children", {})["continue"]
 
-    assert continue_cmd.descriptions["task"] == "📍 当前：工作区 · 会话标题"
-    assert not getattr(continue_cmd, "autocomplete", {})
-
+    assert continue_cmd.descriptions["task"] == "继续要求（直接输入；候选提示显示当前会话）"
+    autocomplete = continue_cmd.autocomplete["task"]
     interaction = SimpleNamespace(channel=SimpleNamespace(id=42), channel_id=42)
-    await continue_cmd.callback(interaction, task="继续修")
+    choices = await autocomplete(interaction, "继续修")
 
+    assert len(choices) == 1
+    assert choices[0].name == "📍 当前：hagent-code · 检查 Discord 注册菜单"
+    assert choices[0].value == "继续修"
+
+    await continue_cmd.callback(interaction, task="继续修")
     adapter._run_simple_slash.assert_awaited_once_with(
         interaction,
         "/claude continue 继续修",
