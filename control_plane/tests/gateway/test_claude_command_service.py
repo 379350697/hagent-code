@@ -743,6 +743,41 @@ def test_claude_narrator_localizes_failed_turn_evidence() -> None:
     assert "断流" in narration.text or "超时" in narration.text or "失败" in narration.text
 
 
+def test_claude_narrator_runtime_labels_do_not_use_app_server() -> None:
+    narrator = ClaudeFieldNarrator()
+    failed = ClaudeRuntimeEvent(
+        id=2,
+        task_key="discord:42:main",
+        task_id="abc123",
+        thread_id="claude-thread-1",
+        turn_id="turn-1",
+        platform="discord",
+        chat_id="42",
+        event_type="turn.failed",
+        payload={"runtime": "agent_sdk", "error": "Claude SDK idle-timed out after 600s."},
+        occurred_at=time.time(),
+    )
+    timed_out = ClaudeRuntimeEvent(
+        id=3,
+        task_key="discord:42:main",
+        task_id="abc123",
+        thread_id="claude-thread-1",
+        turn_id="turn-1",
+        platform="discord",
+        chat_id="42",
+        event_type="progress.turn_timed_out",
+        payload={"runtime": "agent_sdk", "timeout_seconds": 600},
+        occurred_at=time.time(),
+    )
+
+    for event in (failed, timed_out):
+        narration = narrator.narrate(event)
+        assert narration is not None
+        rendered = narration.render()
+        assert "Claude SDK" in rendered
+        assert "app-server" not in rendered
+
+
 def test_claude_narrator_reports_tool_completed() -> None:
     narrator = ClaudeFieldNarrator()
     event = ClaudeRuntimeEvent(

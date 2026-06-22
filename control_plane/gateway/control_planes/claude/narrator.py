@@ -46,6 +46,7 @@ class ClaudeFieldNarrator:
         payload = event.payload
         workspace_name = _workspace_name(workspace or str(payload.get("cwd") or ""))
         short_thread = (thread_id or event.thread_id)[:13] or "pending"
+        runtime_name = _runtime_name(payload.get("runtime") or payload.get("from"))
 
         if event_type in {"progress.session_ready", "usage.updated"}:
             return None
@@ -68,7 +69,7 @@ class ClaudeFieldNarrator:
         if event_type == "progress.turn_timed_out":
             timeout = int(float(payload.get("timeout_seconds") or 0))
             return ClaudeNarration(
-                "这里像是 Claude CLI 没继续吐事件，我会中断这轮并让下一轮干净恢复。",
+                f"这里像是 {runtime_name} 没继续吐事件，我会中断这轮并让下一轮干净恢复。",
                 importance="critical",
                 evidence=[f"最近活动超过 {timeout} 秒"] if timeout else [],
                 dedupe_key="turn_timed_out",
@@ -91,13 +92,13 @@ class ClaudeFieldNarrator:
                     dedupe_key="turn_failed_api_retry",
                 )
             return ClaudeNarration(
-                "这轮 Claude CLI 断流了，我已中断本轮，下一轮会从干净状态继续。",
+                f"这轮 {runtime_name} 断流了，我已中断本轮，下一轮会从干净状态继续。",
                 importance="critical",
                 evidence=[error] if error else [],
                 dedupe_key="turn_failed",
             )
         if event_type == "runtime.fallback":
-            target = str(payload.get("to") or "cli")
+            target = _runtime_name(payload.get("to") or "cli")
             reason = _one_line(_localize_runtime_error(str(payload.get("reason") or "")), 160)
             return ClaudeNarration(
                 f"Claude SDK 主链路不可用，已自动回退到 {target}。",
@@ -303,6 +304,15 @@ def _float_or_zero(value: Any) -> float:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _runtime_name(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"agent_sdk", "agent-sdk", "sdk"}:
+        return "Claude SDK"
+    if raw in {"cli", "claude_cli", "claude-cli", "claude_code", "claude-code"}:
+        return "Claude CLI"
+    return "Claude runtime"
 
 
 def _localize_runtime_error(text: str) -> str:
