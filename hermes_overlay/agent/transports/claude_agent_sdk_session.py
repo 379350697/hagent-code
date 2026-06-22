@@ -17,6 +17,8 @@ from agent.transports.claude_runtime import TurnResult
 
 logger = logging.getLogger(__name__)
 
+_RESULT_GRACE_AFTER_ASSISTANT_END_TURN_SECONDS = 2.0
+
 
 class ClaudeAgentSdkRunner:
     """Thin wrapper around claude-agent-sdk for testable execution."""
@@ -196,6 +198,8 @@ class ClaudeAgentSdkSession:
         tool_iterations = 0
         token_usage: Optional[dict[str, Any]] = None
         result_message: Any = None
+        terminal_assistant: _TerminalAssistant | None = None
+        terminal_assistant_deadline: float | None = None
         raw_tail: deque[str] = deque(maxlen=50)
         last_session_id = self.session_id
         self._started_once = True
@@ -248,6 +252,16 @@ class ClaudeAgentSdkSession:
                     break
                 except asyncio.TimeoutError:
                     now = time.monotonic()
+                    if (
+                        terminal_assistant is not None
+                        and terminal_assistant_deadline is not None
+                        and now >= terminal_assistant_deadline
+                    ):
+                        if pending_next is not None and not pending_next.done():
+                            pending_next.cancel()
+                            with suppress(asyncio.CancelledError, Exception):
+                                await pending_next
+                        break
                     hard_expired = turn_timeout > 0 and now - started_at >= turn_timeout
                     idle_expired = idle_timeout > 0 and now - last_activity_at >= idle_timeout
                     if not hard_expired and not idle_expired:
@@ -289,6 +303,27 @@ class ClaudeAgentSdkSession:
                     assistant_text += parsed.delta_text
                 if parsed.result_message is not None:
                     result_message = parsed.result_message
+                    break
+                if parsed.terminal_assistant is not None:
+                    terminal_assistant = parsed.terminal_assistant
+                    terminal_assistant_deadline = (
+                        time.monotonic() + _RESULT_GRACE_AFTER_ASSISTANT_END_TURN_SECONDS
+                    )
+                if parsed.error:
+                    return TurnResult(
+                        final_text="".join(accumulated),
+                        error=parsed.error,
+                        error_kind=parsed.error_kind or "sdk_assistant_error",
+                        should_retire=True,
+                        session_id=last_session_id,
+                        token_usage_last=token_usage,
+                        token_usage_total=token_usage,
+                        tool_iterations=tool_iterations,
+                        raw_output_tail=list(raw_tail),
+                        runtime="agent_sdk",
+                        runtime_profile=str(self._config.get("name") or ""),
+                        started=True,
+                    )
                 if progress_callback is not None:
                     for event in parsed.progress_events:
                         progress_callback(event)
@@ -313,6 +348,7 @@ class ClaudeAgentSdkSession:
         result = _result_from_sdk_message(
             result_message,
             fallback_text="".join(accumulated),
+            terminal_assistant=terminal_assistant,
         )
         if result.session_id:
             last_session_id = result.session_id
@@ -373,6 +409,9 @@ class _ParsedSdkMessage:
         usage: Optional[dict[str, Any]] = None,
         tool_count: int = 0,
         result_message: Any = None,
+        terminal_assistant: Optional["_TerminalAssistant"] = None,
+        error: str = "",
+        error_kind: str = "",
         progress_events: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         self.delta_text = delta_text
@@ -380,7 +419,25 @@ class _ParsedSdkMessage:
         self.usage = usage
         self.tool_count = tool_count
         self.result_message = result_message
+        self.terminal_assistant = terminal_assistant
+        self.error = error
+        self.error_kind = error_kind
         self.progress_events = list(progress_events or [])
+
+
+class _TerminalAssistant:
+    def __init__(
+        self,
+        *,
+        text: str,
+        session_id: str = "",
+        usage: Optional[dict[str, Any]] = None,
+        stop_reason: str = "",
+    ) -> None:
+        self.text = text
+        self.session_id = session_id
+        self.usage = usage
+        self.stop_reason = stop_reason
 
 
 def _parse_sdk_message(message: Any, assistant_text: str) -> _ParsedSdkMessage:
@@ -389,6 +446,8 @@ def _parse_sdk_message(message: Any, assistant_text: str) -> _ParsedSdkMessage:
         data = getattr(message, "data", {}) or {}
         session_id = str(data.get("session_id") or "")
         subtype = str(getattr(message, "subtype", "") or "")
+        if subtype == "thinking_tokens":
+            return _ParsedSdkMessage(session_id=session_id)
         return _ParsedSdkMessage(
             session_id=session_id,
             progress_events=[{
@@ -402,6 +461,18 @@ def _parse_sdk_message(message: Any, assistant_text: str) -> _ParsedSdkMessage:
         text, tool_events, tool_count = _assistant_parts(message)
         delta = text[len(assistant_text):] if text and text.startswith(assistant_text) else text
         usage = _extract_usage(getattr(message, "usage", None))
+        session_id = str(getattr(message, "session_id", "") or "")
+        stop_reason = str(getattr(message, "stop_reason", "") or "")
+        error = getattr(message, "error", None)
+        if error:
+            return _ParsedSdkMessage(
+                delta_text=delta,
+                session_id=session_id,
+                usage=usage,
+                tool_count=tool_count,
+                error=str(error),
+                error_kind="sdk_assistant_error",
+            )
         events = []
         if delta:
             events.append({
@@ -413,8 +484,19 @@ def _parse_sdk_message(message: Any, assistant_text: str) -> _ParsedSdkMessage:
         events.extend(tool_events)
         return _ParsedSdkMessage(
             delta_text=delta,
+            session_id=session_id,
             usage=usage,
             tool_count=tool_count,
+            terminal_assistant=(
+                _TerminalAssistant(
+                    text=text,
+                    session_id=session_id,
+                    usage=usage,
+                    stop_reason=stop_reason,
+                )
+                if stop_reason == "end_turn" and text.strip()
+                else None
+            ),
             progress_events=events,
         )
     if class_name == "ResultMessage":
@@ -445,6 +527,21 @@ def _parse_sdk_message(message: Any, assistant_text: str) -> _ParsedSdkMessage:
             progress_events=[{
                 "stage": "notification",
                 "method": "rate_limit",
+                "runtime": "agent_sdk",
+            }],
+        )
+    if class_name == "StreamEvent":
+        event = getattr(message, "event", {}) or {}
+        delta = event.get("delta") if isinstance(event, dict) else {}
+        if isinstance(delta, dict) and delta.get("type") == "thinking_delta":
+            return _ParsedSdkMessage(
+                session_id=str(getattr(message, "session_id", "") or "")
+            )
+        return _ParsedSdkMessage(
+            session_id=str(getattr(message, "session_id", "") or ""),
+            progress_events=[{
+                "stage": "notification",
+                "method": "StreamEvent",
                 "runtime": "agent_sdk",
             }],
         )
@@ -485,8 +582,22 @@ def _assistant_parts(message: Any) -> tuple[str, list[dict[str, Any]], int]:
     return "".join(text_parts), events, tool_count
 
 
-def _result_from_sdk_message(message: Any, *, fallback_text: str) -> TurnResult:
+def _result_from_sdk_message(
+    message: Any,
+    *,
+    fallback_text: str,
+    terminal_assistant: Optional[_TerminalAssistant] = None,
+) -> TurnResult:
     if message is None:
+        if terminal_assistant is not None:
+            return TurnResult(
+                final_text=terminal_assistant.text or fallback_text,
+                session_id=terminal_assistant.session_id,
+                token_usage_last=terminal_assistant.usage,
+                token_usage_total=terminal_assistant.usage,
+                warning="Claude SDK finished without ResultMessage.",
+                error_kind="sdk_missing_result",
+            )
         return TurnResult(
             final_text=fallback_text,
             error="Claude SDK ended without a ResultMessage.",
@@ -633,9 +744,77 @@ def _next_timeout(
 
 def _message_summary(message: Any) -> str:
     try:
-        return json.dumps(_to_safe_json(message), ensure_ascii=False, sort_keys=True)
+        return json.dumps(_safe_message_summary(message), ensure_ascii=False, sort_keys=True)
     except Exception:
-        return repr(message)
+        return message.__class__.__name__ or "sdk_message"
+
+
+def _safe_message_summary(message: Any) -> dict[str, Any]:
+    class_name = message.__class__.__name__
+    if class_name == "SystemMessage":
+        data = getattr(message, "data", {}) or {}
+        return {
+            "type": class_name,
+            "subtype": str(getattr(message, "subtype", "") or ""),
+            "session_id": str(data.get("session_id") or ""),
+            "estimated_tokens": data.get("estimated_tokens"),
+            "estimated_tokens_delta": data.get("estimated_tokens_delta"),
+        }
+    if class_name == "AssistantMessage":
+        content = getattr(message, "content", []) or []
+        tool_names: list[str] = []
+        block_types: list[str] = []
+        for block in content:
+            block_type = getattr(block, "type", "") or (
+                block.get("type") if isinstance(block, dict) else ""
+            )
+            if block_type:
+                block_types.append(str(block_type))
+            name = getattr(block, "name", None)
+            if name is None and isinstance(block, dict):
+                name = block.get("name")
+            if name:
+                tool_names.append(str(name))
+        return {
+            "type": class_name,
+            "session_id": str(getattr(message, "session_id", "") or ""),
+            "stop_reason": str(getattr(message, "stop_reason", "") or ""),
+            "error": str(getattr(message, "error", "") or ""),
+            "content_types": block_types[:20],
+            "tool_names": tool_names[:20],
+            "usage": _extract_usage(getattr(message, "usage", None)),
+        }
+    if class_name == "ResultMessage":
+        return {
+            "type": class_name,
+            "session_id": str(getattr(message, "session_id", "") or ""),
+            "subtype": str(getattr(message, "subtype", "") or ""),
+            "is_error": bool(getattr(message, "is_error", False)),
+            "stop_reason": str(getattr(message, "stop_reason", "") or ""),
+            "api_error_status": getattr(message, "api_error_status", None),
+            "usage": _extract_usage(getattr(message, "usage", None)),
+        }
+    if class_name == "StreamEvent":
+        event = getattr(message, "event", {}) or {}
+        delta = event.get("delta") if isinstance(event, dict) else {}
+        content_block = event.get("content_block") if isinstance(event, dict) else {}
+        usage = event.get("usage") if isinstance(event, dict) else None
+        return {
+            "type": class_name,
+            "session_id": str(getattr(message, "session_id", "") or ""),
+            "event_type": str(event.get("type") or "") if isinstance(event, dict) else "",
+            "delta_type": str(delta.get("type") or "") if isinstance(delta, dict) else "",
+            "content_block_type": (
+                str(content_block.get("type") or "") if isinstance(content_block, dict) else ""
+            ),
+            "stop_reason": (
+                str((event.get("delta") or {}).get("stop_reason") or "")
+                if isinstance(event, dict) and isinstance(event.get("delta"), dict)
+                else ""
+            ),
+            "usage": _extract_usage(usage),
+        }
+    return {"type": class_name or "sdk_message"}
 
 
 def _to_safe_json(value: Any) -> Any:

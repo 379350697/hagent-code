@@ -370,11 +370,16 @@ async def test_claude_continue_updates_existing_session_record(tmp_path, monkeyp
     assert first.thread_id == second.thread_id
     assert first.task_id == second.task_id
     assert len(service._registry.records) == 1
-    assert "任务：123" in status.text
-    assert "任务：456" not in status.text
+    record = service._registry.get(task_id=first.task_id)
+    assert record is not None
+    assert record.title == "456"
+    assert "任务：456" in status.text
+    assert "任务：123" not in status.text
     assert "轮次：turn-2" in status.text
     assert first.task_id not in status.text
     assert first.thread_id not in status.text
+    assert "456" in sessions.text
+    assert "123" not in sessions.text
     assert first.thread_id[:8] not in sessions.text
 
 

@@ -317,7 +317,10 @@ async def test_codex_registers_diagnostics_subcommands(adapter):
 
 
 @pytest.mark.asyncio
-async def test_codex_continue_autocomplete_shows_current_session_context(adapter, monkeypatch):
+async def test_codex_continue_has_no_autocomplete_and_posts_context(adapter, monkeypatch):
+    """`/codex continue` must NOT use autocomplete (no filter dropdown). The
+    current workspace · session title is shown as a plain context message
+    before the task is dispatched."""
     from gateway.control_planes import codex as codex_pkg
 
     record = SimpleNamespace(
@@ -343,22 +346,35 @@ async def test_codex_continue_autocomplete_shows_current_session_context(adapter
 
     codex = adapter._client.tree.commands["codex"]
     continue_cmd = getattr(codex, "_children", {})["continue"]
-    autocomplete = getattr(continue_cmd, "autocomplete", {})["task"]
+
+    # No autocomplete filter dropdown on the `task` option.
+    assert not getattr(continue_cmd, "autocomplete", {})
+
+    channel_send = AsyncMock()
     interaction = SimpleNamespace(
-        channel=SimpleNamespace(id=42),
+        channel=SimpleNamespace(id=42, send=channel_send),
         channel_id=42,
     )
+    adapter._run_simple_slash = AsyncMock()
 
-    choices = await autocomplete(interaction, "继续执行")
+    await continue_cmd.callback(interaction, task="继续执行")
 
-    assert len(choices) == 1
-    assert "当前：wlcodex" in choices[0].name
-    assert "看下 web 模式会话流是否真实流式" in choices[0].name
-    assert choices[0].value == "继续执行"
+    # Context line is posted as a plain message (display only, not a Choice).
+    channel_send.assert_awaited_once()
+    posted = channel_send.await_args.args[0]
+    assert "当前：wlcodex" in posted
+    assert "看下 web 模式会话流是否真实流式" in posted
+    # And the task still dispatches.
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/codex continue 继续执行", echo=True,
+    )
 
 
 @pytest.mark.asyncio
-async def test_claude_continue_autocomplete_shows_current_session_context(adapter, monkeypatch):
+async def test_claude_continue_has_no_autocomplete_and_posts_context(adapter, monkeypatch):
+    """`/claude continue` must NOT use autocomplete (no filter dropdown). The
+    current workspace · session title is shown as a plain context message
+    before the task is dispatched."""
     from gateway.control_planes import claude as claude_pkg
 
     record = SimpleNamespace(
@@ -384,18 +400,26 @@ async def test_claude_continue_autocomplete_shows_current_session_context(adapte
 
     claude = adapter._client.tree.commands["claude"]
     continue_cmd = getattr(claude, "_children", {})["continue"]
-    autocomplete = getattr(continue_cmd, "autocomplete", {})["task"]
+
+    # No autocomplete filter dropdown on the `task` option.
+    assert not getattr(continue_cmd, "autocomplete", {})
+
+    channel_send = AsyncMock()
     interaction = SimpleNamespace(
-        channel=SimpleNamespace(id=42),
+        channel=SimpleNamespace(id=42, send=channel_send),
         channel_id=42,
     )
+    adapter._run_simple_slash = AsyncMock()
 
-    choices = await autocomplete(interaction, "继续修")
+    await continue_cmd.callback(interaction, task="继续修")
 
-    assert len(choices) == 1
-    assert "当前：hagent-code" in choices[0].name
-    assert "检查 Discord 注册菜单" in choices[0].name
-    assert choices[0].value == "继续修"
+    channel_send.assert_awaited_once()
+    posted = channel_send.await_args.args[0]
+    assert "当前：hagent-code" in posted
+    assert "检查 Discord 注册菜单" in posted
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/claude continue 继续修", echo=True,
+    )
 
 
 # ------------------------------------------------------------------

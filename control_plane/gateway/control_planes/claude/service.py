@@ -935,6 +935,7 @@ class ClaudeCommandService:
                 turn_id="",
                 model=model,
                 permission_mode=permission_mode,
+                title=" ".join(prompt.strip().split())[:80],
                 turn_started_at=turn_started_at,
                 completed_at=None,
                 token_usage={},

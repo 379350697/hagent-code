@@ -33,6 +33,9 @@ class AssistantMessage:
     content: list[Any]
     model: str = "deepseek-v4-pro"
     usage: dict[str, Any] | None = None
+    stop_reason: str | None = None
+    error: str | None = None
+    session_id: str | None = None
 
 
 @dataclass
@@ -47,6 +50,13 @@ class ResultMessage:
     usage: dict[str, Any] | None = None
     api_error_status: int | None = None
     errors: list[str] | None = None
+
+
+@dataclass
+class StreamEvent:
+    uuid: str
+    session_id: str
+    event: dict[str, Any]
 
 
 class FakeRunner:
@@ -139,6 +149,102 @@ def test_sdk_session_runs_successful_turn() -> None:
     assert runner.calls[0]["session_id"] == ""
 
 
+def test_sdk_session_accepts_end_turn_without_result_message() -> None:
+    runner = FakeRunner([
+        AssistantMessage(
+            content=[TextBlock("final answer")],
+            stop_reason="end_turn",
+            session_id="sdk-session-1",
+            usage={"input_tokens": 7, "output_tokens": 3},
+        ),
+    ])
+    session = ClaudeAgentSdkSession(
+        cwd="/tmp",
+        sdk_profile_config=_profile(),
+        runner=runner,
+    )
+
+    result = session.run_turn("hello", turn_timeout=3, idle_timeout=3)
+
+    assert result.error is None
+    assert result.final_text == "final answer"
+    assert result.warning == "Claude SDK finished without ResultMessage."
+    assert result.error_kind == "sdk_missing_result"
+    assert result.session_id == "sdk-session-1"
+    assert result.token_usage_total["total_tokens"] == 10
+
+
+def test_sdk_session_waits_for_result_after_tool_use_stop_reason() -> None:
+    runner = FakeRunner([
+        AssistantMessage(
+            content=[TextBlock("running tool"), ToolUseBlock("Bash", {"command": "pwd"})],
+            stop_reason="tool_use",
+            session_id="sdk-session-1",
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sdk-session-1",
+            result="done after tool",
+        ),
+    ])
+    session = ClaudeAgentSdkSession(cwd="/tmp", sdk_profile_config=_profile(), runner=runner)
+
+    result = session.run_turn("hello")
+
+    assert result.error is None
+    assert result.final_text == "done after tool"
+    assert result.tool_iterations == 1
+
+
+def test_sdk_session_result_message_overrides_end_turn_text() -> None:
+    runner = FakeRunner([
+        AssistantMessage(
+            content=[TextBlock("assistant text")],
+            stop_reason="end_turn",
+            session_id="sdk-session-1",
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sdk-session-1",
+            result="result text",
+            usage={"input_tokens": 20, "output_tokens": 6},
+        ),
+    ])
+    session = ClaudeAgentSdkSession(cwd="/tmp", sdk_profile_config=_profile(), runner=runner)
+
+    result = session.run_turn("hello")
+
+    assert result.error is None
+    assert result.warning is None
+    assert result.final_text == "result text"
+    assert result.token_usage_total["total_tokens"] == 26
+
+
+def test_sdk_session_classifies_assistant_error() -> None:
+    runner = FakeRunner([
+        AssistantMessage(
+            content=[TextBlock("partial")],
+            error="model failed",
+            session_id="sdk-session-1",
+        ),
+    ])
+    session = ClaudeAgentSdkSession(cwd="/tmp", sdk_profile_config=_profile(), runner=runner)
+
+    result = session.run_turn("hello")
+
+    assert result.final_text == "partial"
+    assert result.error == "model failed"
+    assert result.error_kind == "sdk_assistant_error"
+
+
 def test_sdk_session_resumes_existing_session() -> None:
     runner = FakeRunner([
         ResultMessage(
@@ -221,3 +327,30 @@ def test_sdk_raw_tail_redacts_secrets() -> None:
     assert "abc" not in redacted
     assert "sk-secret123" not in redacted
     assert "[REDACTED]" in redacted
+
+
+def test_sdk_raw_tail_omits_thinking_delta_text() -> None:
+    runner = FakeRunner([
+        StreamEvent(
+            uuid="event-1",
+            session_id="sdk-session-1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "thinking_delta", "thinking": "private chain text"},
+            },
+        ),
+        AssistantMessage(
+            content=[TextBlock("done")],
+            stop_reason="end_turn",
+            session_id="sdk-session-1",
+        ),
+    ])
+    session = ClaudeAgentSdkSession(cwd="/tmp", sdk_profile_config=_profile(), runner=runner)
+
+    result = session.run_turn("hello", turn_timeout=3, idle_timeout=3)
+
+    assert result.error is None
+    assert result.final_text == "done"
+    joined_tail = "\n".join(result.raw_output_tail)
+    assert "private chain text" not in joined_tail
+    assert "thinking_delta" in joined_tail
