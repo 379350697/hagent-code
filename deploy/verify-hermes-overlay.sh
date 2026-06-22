@@ -52,8 +52,12 @@ required=(
   "gateway/control_planes/codex/repair.py"
   "gateway/control_planes/claude/service.py"
   "gateway/control_planes/claude/narrator.py"
+  "gateway/control_planes/claude/runtime_config.py"
   "agent/transports/codex_app_server_session.py"
+  "agent/transports/claude_agent_sdk_session.py"
   "agent/transports/claude_cli_session.py"
+  "agent/transports/claude_runtime.py"
+  "agent/transports/claude_runtime_factory.py"
   "gateway/slash_commands.py"
   "plugins/platforms/discord/adapter.py"
   "tools/approval.py"
@@ -72,7 +76,10 @@ mapfile -t py_files < <(
     find "$hermes_agent/gateway/control_planes/claude" -type f -name '*.py'
     printf '%s\n' \
       "$hermes_agent/agent/transports/codex_app_server_session.py" \
+      "$hermes_agent/agent/transports/claude_agent_sdk_session.py" \
       "$hermes_agent/agent/transports/claude_cli_session.py" \
+      "$hermes_agent/agent/transports/claude_runtime.py" \
+      "$hermes_agent/agent/transports/claude_runtime_factory.py" \
       "$hermes_agent/gateway/slash_commands.py" \
       "$hermes_agent/gateway/run.py" \
       "$hermes_agent/gateway/platforms/api_server.py" \
@@ -83,6 +90,7 @@ mapfile -t py_files < <(
 )
 
 "$python_bin" -m py_compile "${py_files[@]}"
+"$python_bin" -c "import claude_agent_sdk"
 
 if [[ -x "$hermes_agent/venv/bin/python" ]]; then
   (
@@ -92,7 +100,12 @@ if [[ -x "$hermes_agent/venv/bin/python" ]]; then
       tests/gateway/test_codex_control_architecture.py \
       tests/gateway/test_claude_command_service.py \
       tests/gateway/test_claude_control_architecture.py \
+      tests/gateway/test_claude_runtime_config.py \
+      tests/gateway/test_claude_session_pool_runtime.py \
+      tests/agent/transports/test_claude_agent_sdk_session.py \
+      tests/agent/transports/test_claude_runtime_factory.py \
       tests/agent/transports/test_codex_app_server_session.py \
+      tests/agent/transports/test_claude_cli_session.py \
       tests/gateway/test_discord_slash_commands.py \
       -q
   )

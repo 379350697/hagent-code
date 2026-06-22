@@ -18,8 +18,11 @@ from agent.transports.claude_cli_session import (
     ClaudeCliSession,
     TurnResult,
     _coerce_turn_input_text,
+    _nonzero_exit_error,
     _normalize_permission_mode,
     _parse_stream_line,
+    _redact_raw_line,
+    _success_then_nonzero_warning,
     parse_claude_help,
     resolve_claude_binary,
 )
@@ -222,6 +225,27 @@ def test_parse_stream_line_handles_system_event() -> None:
     progress, delta, _, _, _ = events[0]
     assert progress["subtype"] == "api_retry"
     assert delta == ""
+
+
+def test_claude_nonzero_exit_classifies_api_retries() -> None:
+    message, kind = _nonzero_exit_error(1, api_retry_count=7)
+    assert kind == "api_retry_non_zero_exit"
+    assert "7 retries" in message
+    assert "status 1" in message
+
+
+def test_claude_success_then_exit_warning_is_distinct() -> None:
+    warning = _success_then_nonzero_warning(1, 2)
+    assert "successful result event" in warning
+    assert "2 API retries" in warning
+
+
+def test_claude_raw_tail_redacts_secrets() -> None:
+    line = "Authorization: Bearer abc123 token=sk-test-secret"
+    redacted = _redact_raw_line(line)
+    assert "abc123" not in redacted
+    assert "sk-test-secret" not in redacted
+    assert "[REDACTED]" in redacted
 
 
 def test_parse_stream_line_handles_hook_event() -> None:

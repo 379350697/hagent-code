@@ -27,12 +27,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from agent.transports.claude_runtime import TurnResult
 
 logger = logging.getLogger(__name__)
 
@@ -161,23 +165,6 @@ async def probe_claude_capabilities(
         text += "\n" + stderr.decode("utf-8", errors="replace")
     caps = parse_claude_help(text)
     return caps if caps.print_prompt else ClaudeCliCapabilities.minimal()
-
-
-@dataclass
-class TurnResult:
-    """Result of one user→assistant→tool turn through the Claude CLI."""
-
-    final_text: str = ""
-    projected_messages: list[dict] = field(default_factory=list)
-    tool_iterations: int = 0
-    interrupted: bool = False
-    error: Optional[str] = None
-    turn_id: Optional[str] = None
-    thread_id: Optional[str] = None
-    session_id: Optional[str] = None
-    token_usage_last: Optional[dict[str, Any]] = None
-    token_usage_total: Optional[dict[str, Any]] = None
-    should_retire: bool = False
 
 
 @dataclass(frozen=True)
@@ -378,6 +365,10 @@ class ClaudeCliSession:
         last_session_id = self.session_id
         token_usage: Optional[dict[str, Any]] = None
         stream_error = ""
+        stream_error_kind = ""
+        api_retry_count = 0
+        result_success_seen = False
+        raw_tail: deque[str] = deque(maxlen=50)
         reader_task: Optional[asyncio.Task[bytes]] = asyncio.create_task(
             proc.stdout.readline()
         )
@@ -450,9 +441,20 @@ class ClaudeCliSession:
                     else:
                         last_activity_at = asyncio.get_running_loop().time()
                         decoded = line.decode("utf-8", errors="replace")
+                        raw_tail.append(_redact_raw_line(decoded.rstrip("\r\n")))
                         for parsed, delta_text, usage, session_id, tool_count in (
                             _parse_stream_line(decoded, assistant_text)
                         ):
+                            if (
+                                parsed.get("stage") == "notification"
+                                and parsed.get("subtype") == "api_retry"
+                            ):
+                                api_retry_count += 1
+                            if (
+                                parsed.get("stage") == "turn_completed"
+                                and parsed.get("subtype") in {"success", "done"}
+                            ):
+                                result_success_seen = True
                             if session_id:
                                 last_session_id = session_id
                             if usage:
@@ -460,6 +462,9 @@ class ClaudeCliSession:
                             if tool_count:
                                 tool_iterations += tool_count
                             if parsed.get("stage") == "error":
+                                stream_error_kind = str(
+                                    parsed.get("subtype") or parsed.get("error_kind") or "stream_error"
+                                )
                                 stream_error = str(
                                     parsed.get("error")
                                     or parsed.get("subtype")
@@ -508,6 +513,8 @@ class ClaudeCliSession:
                 token_usage_last=token_usage,
                 token_usage_total=token_usage,
                 tool_iterations=tool_iterations,
+                error_kind=timeout_reason,
+                raw_output_tail=list(raw_tail),
             )
 
         text = "".join(accumulated)
@@ -521,16 +528,44 @@ class ClaudeCliSession:
                 token_usage_last=token_usage,
                 token_usage_total=token_usage,
                 tool_iterations=tool_iterations,
+                error_kind=stream_error_kind or "stream_error",
+                exit_status=exit_code,
+                api_retry_count=api_retry_count,
+                raw_output_tail=list(raw_tail),
             )
         if exit_code != 0:
+            if result_success_seen:
+                self.session_id = last_session_id
+                self.thread_id = last_session_id or self.thread_id
+                warning = _success_then_nonzero_warning(exit_code, api_retry_count)
+                return TurnResult(
+                    final_text=text,
+                    warning=warning,
+                    error_kind="success_result_then_exit_1",
+                    exit_status=exit_code,
+                    api_retry_count=api_retry_count,
+                    raw_output_tail=list(raw_tail),
+                    session_id=last_session_id,
+                    token_usage_last=token_usage,
+                    token_usage_total=token_usage,
+                    tool_iterations=tool_iterations,
+                )
+            error_text, error_kind = _nonzero_exit_error(
+                exit_code,
+                api_retry_count=api_retry_count,
+            )
             return TurnResult(
                 final_text=text,
-                error=f"Claude exited with status {exit_code}.",
+                error=error_text,
                 should_retire=True,
                 session_id=last_session_id,
                 token_usage_last=token_usage,
                 token_usage_total=token_usage,
                 tool_iterations=tool_iterations,
+                error_kind=error_kind,
+                exit_status=exit_code,
+                api_retry_count=api_retry_count,
+                raw_output_tail=list(raw_tail),
             )
         self.session_id = last_session_id
         self.thread_id = last_session_id or self.thread_id
@@ -540,6 +575,7 @@ class ClaudeCliSession:
             token_usage_last=token_usage,
             token_usage_total=token_usage,
             tool_iterations=tool_iterations,
+            runtime="cli",
         )
 
     def _run_turn_in_thread(
@@ -972,6 +1008,21 @@ _CLAUDE_ENV_DENY_SUBSTRINGS: tuple[str, ...] = (
     "TELEGRAM_API_TOKEN",
 )
 
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"\b("
+    r"(?:[A-Za-z0-9_]*_)?"
+    r"(?:password|passwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization|auth)"
+    r"(?:_[A-Za-z0-9_]*)?"
+    r")\s*([=:])\s*([\"']?)([^\s\"'`;,]+)",
+    re.IGNORECASE,
+)
+_BEARER_RE = re.compile(r"\b(Bearer)\s+([A-Za-z0-9._~+/\-]+=*)", re.IGNORECASE)
+_AUTH_HEADER_RE = re.compile(
+    r"\b(Authorization)\s*:\s*(?:Bearer\s+)?([^\s;,]+)",
+    re.IGNORECASE,
+)
+_SK_SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{6,}\b")
+
 
 def _sanitized_env() -> dict[str, str]:
     """Return a Claude subprocess env without platform delivery secrets."""
@@ -985,6 +1036,38 @@ def _sanitized_env() -> dict[str, str]:
                 del result[key]
                 break
     return result
+
+
+def _redact_raw_line(text: str) -> str:
+    redacted = _AUTH_HEADER_RE.sub(lambda m: f"{m.group(1)}: [REDACTED]", text)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]",
+        redacted,
+    )
+    redacted = _BEARER_RE.sub(lambda m: f"{m.group(1)} [REDACTED]", redacted)
+    redacted = _SK_SECRET_RE.sub("[REDACTED]", redacted)
+    return redacted[:2000]
+
+
+def _nonzero_exit_error(exit_code: int, *, api_retry_count: int) -> tuple[str, str]:
+    if api_retry_count:
+        return (
+            "Claude API retries were exhausted before the CLI exited "
+            f"with status {exit_code} ({api_retry_count} retries observed).",
+            "api_retry_non_zero_exit",
+        )
+    return (
+        f"Claude CLI exited with status {exit_code} before a successful result event.",
+        "non_zero_exit",
+    )
+
+
+def _success_then_nonzero_warning(exit_code: int, api_retry_count: int) -> str:
+    retry_note = f"; {api_retry_count} API retries observed" if api_retry_count else ""
+    return (
+        "Claude returned a successful result event, but the CLI process exited "
+        f"with status {exit_code}{retry_note}."
+    )
 
 
 _PERMISSION_MODE_ALIASES: dict[str, str] = {

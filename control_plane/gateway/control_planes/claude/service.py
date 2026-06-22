@@ -6,10 +6,11 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
-from agent.transports.claude_cli_session import ClaudeCliSession
+from agent.transports.claude_runtime import ClaudeRuntimeSession
 
 from .approval import ClaudeApprovalBridge
 from .doctor import format_doctor_checks, run_claude_doctor
@@ -22,6 +23,7 @@ from .formatting import (
 )
 from .execution import run_blocking
 from .git_digest import format_git_digest, git_digest
+from .local_sessions import ClaudeLocalSession, ClaudeLocalSessionIndex
 from .models import CommandRequest, CommandResult
 from .narrator import ClaudeFieldNarrator, event_type_from_progress
 from .registry import ClaudeTaskRegistry
@@ -30,12 +32,17 @@ from .runtime_config import (
     PLAN_PROMPT_PREFIX,
     DEFAULT_CLAUDE_PERMISSION_MODE,
     claude_cli_config_overrides,
+    claude_runtime,
+    claude_runtime_fallback,
+    claude_sdk_profile_name,
     claude_cli_turn_options,
     claude_permission_profiles,
     load_claude_cfg,
     normalize_permission_mode,
     normalize_permission_profile,
     read_claude_config_model,
+    resolve_claude_sdk_profile,
+    safe_claude_sdk_profile_diagnostics,
 )
 from .selection import SelectedSessionStore
 from .session_pool import ClaudeSessionPool, LiveSession
@@ -58,9 +65,10 @@ class ClaudeCommandService:
         registry: Any = None,
         workspace_store: Any = None,
         selected_store: Any = None,
-        session_factory: Optional[Callable[..., ClaudeCliSession]] = None,
+        session_factory: Optional[Callable[..., ClaudeRuntimeSession]] = None,
         event_store: Any = None,
         narrator: ClaudeFieldNarrator | None = None,
+        local_session_index: ClaudeLocalSessionIndex | None = None,
     ) -> None:
         if registry is None:
             registry = ClaudeTaskRegistry()
@@ -70,6 +78,7 @@ class ClaudeCommandService:
         self._sessions = ClaudeSessionPool(session_factory=session_factory)
         self._event_store = event_store or ClaudeRuntimeEventStore()
         self._narrator = narrator or ClaudeFieldNarrator()
+        self._local_sessions = local_session_index or ClaudeLocalSessionIndex()
 
     async def handle(self, request: CommandRequest) -> CommandResult:
         raw_args = (request.text or "").strip()
@@ -84,7 +93,9 @@ class ClaudeCommandService:
             return await self._doctor(request, task_key)
         if subcommand in {"events", "eventlog", "log"}:
             return self._events_status(request, task_key, rest)
-        if subcommand in {"sessions", "tasks", "ls", "list"}:
+        if subcommand in {"sessions", "session", "tasks", "ls", "list"}:
+            if subcommand == "session" and rest.strip():
+                return self._select_session(request, task_key, rest)
             return self._sessions_status(request, task_key, rest)
         if subcommand in {"select", "use"}:
             return self._select_session(request, task_key, rest)
@@ -533,6 +544,15 @@ class ClaudeCommandService:
                     f"{self._workspace_label(str(getattr(record, 'workspace', '') or ''))}"
                 ).lower()
             ]
+        records.extend(
+            self._local_session_records(
+                request,
+                task_key,
+                include_all=include_all,
+                workspace_query=workspace_query,
+                limit=limit,
+            )
+        )
         records = [
             record
             for record in self._dedupe_session_records(records)
@@ -751,6 +771,10 @@ class ClaudeCommandService:
         claude_cfg = load_claude_cfg()
         config_overrides = claude_cli_config_overrides(claude_cfg)
         turn_options = claude_cli_turn_options(claude_cfg)
+        runtime = claude_runtime(claude_cfg)
+        runtime_fallback = claude_runtime_fallback(claude_cfg)
+        sdk_profile = claude_sdk_profile_name(claude_cfg)
+        sdk_profile_config = resolve_claude_sdk_profile(claude_cfg)
         prelocked_live = self._sessions.peek(task_key)
         acquired_live = None
         if prelocked_live is not None:
@@ -763,7 +787,11 @@ class ClaudeCommandService:
         permission_mode = normalize_permission_mode(
             str(claude_cfg.get("permission_mode") or DEFAULT_CLAUDE_PERMISSION_MODE)
         )
-        model = str(claude_cfg.get("model") or read_claude_config_model())
+        model = str(
+            claude_cfg.get("model")
+            or sdk_profile_config.get("model")
+            or read_claude_config_model()
+        )
         effort = str(claude_cfg.get("effort") or "")
         live = self._sessions.get(
             task_key,
@@ -774,6 +802,10 @@ class ClaudeCommandService:
             permission_mode=permission_mode,
             model=model,
             effort=effort,
+            runtime=runtime,
+            runtime_fallback=runtime_fallback,
+            sdk_profile=sdk_profile,
+            sdk_profile_config=sdk_profile_config,
         )
         if live is None:
             if acquired_live is not None:
@@ -839,10 +871,16 @@ class ClaudeCommandService:
         select_session: bool = False,
     ) -> CommandResult:
         claude_cfg = claude_cfg if isinstance(claude_cfg, dict) else load_claude_cfg()
+        runtime = claude_runtime(claude_cfg)
+        sdk_profile_config = resolve_claude_sdk_profile(claude_cfg)
         turn_options = (
             turn_options if isinstance(turn_options, dict) else claude_cli_turn_options(claude_cfg)
         )
-        model = str(claude_cfg.get("model") or read_claude_config_model())
+        model = str(
+            claude_cfg.get("model")
+            or sdk_profile_config.get("model")
+            or read_claude_config_model()
+        )
         permission_mode = normalize_permission_mode(
             str(claude_cfg.get("permission_mode") or DEFAULT_CLAUDE_PERMISSION_MODE)
         )
@@ -858,6 +896,8 @@ class ClaudeCommandService:
             )
 
         record = None if new_session else self._session_record(task_key, thread_id)
+        if _is_local_session_record(record):
+            record = None
         task_id = getattr(record, "task_id", "") or task_id_for(thread_id)
         live.active_task_id = task_id
         turn_started_at = time.time()
@@ -931,6 +971,8 @@ class ClaudeCommandService:
         elif getattr(turn, "interrupted", False):
             status = "interrupted"
             last_message = "Claude: turn interrupted"
+        elif getattr(turn, "warning", None):
+            last_message = str(turn.warning)
         resolved_thread_id = (
             str(
                 getattr(turn, "session_id", "")
@@ -975,11 +1017,42 @@ class ClaudeCommandService:
             payload={
                 "status": status,
                 "error": str(getattr(turn, "error", "") or ""),
+                "warning": str(getattr(turn, "warning", "") or ""),
+                "error_kind": str(getattr(turn, "error_kind", "") or ""),
+                "exit_status": getattr(turn, "exit_status", None),
+                "api_retry_count": getattr(turn, "api_retry_count", 0),
+                "raw_tail": getattr(turn, "raw_output_tail", []) or [],
+                "runtime": str(getattr(turn, "runtime", "") or runtime),
+                "runtime_profile": str(
+                    getattr(turn, "runtime_profile", "")
+                    or sdk_profile_config.get("name")
+                    or ""
+                ),
+                "fallback_runtime": str(getattr(turn, "fallback_runtime", "") or ""),
+                "fallback_reason": str(getattr(turn, "fallback_reason", "") or ""),
                 "interrupted": bool(getattr(turn, "interrupted", False)),
             },
             notify=progress_notify,
             workspace=workspace,
         )
+        if getattr(turn, "fallback_reason", None):
+            self._append_runtime_event(
+                task_key=task_key,
+                task_id=task_id,
+                thread_id=thread_id,
+                turn_id=getattr(turn, "turn_id", None) or "",
+                platform=request.platform,
+                chat_id=request.chat_id,
+                event_type="runtime.fallback",
+                payload={
+                    "from": runtime,
+                    "to": str(getattr(turn, "fallback_runtime", "") or ""),
+                    "reason": str(getattr(turn, "fallback_reason", "") or ""),
+                    "sdk_profile": safe_claude_sdk_profile_diagnostics(sdk_profile_config),
+                },
+                notify=progress_notify,
+                workspace=workspace,
+            )
         if getattr(turn, "should_retire", False):
             self._sessions.retire(task_key, live)
 
@@ -989,12 +1062,25 @@ class ClaudeCommandService:
             if getattr(turn, "error", None)
             else format_run_success(workspace, thread_id, text)
         )
+        if not getattr(turn, "error", None) and getattr(turn, "warning", None):
+            output = f"{output}\n\n提醒：{format_failure('Claude CLI', str(turn.warning))}"
         return CommandResult(
             output,
             status=status,
             task_id=task_id,
             thread_id=thread_id,
-            diagnostics={"turn_id": getattr(turn, "turn_id", None) or ""},
+            diagnostics={
+                "turn_id": getattr(turn, "turn_id", None) or "",
+                "warning": str(getattr(turn, "warning", "") or ""),
+                "error_kind": str(getattr(turn, "error_kind", "") or ""),
+                "runtime": str(getattr(turn, "runtime", "") or runtime),
+                "runtime_profile": str(
+                    getattr(turn, "runtime_profile", "")
+                    or sdk_profile_config.get("name")
+                    or ""
+                ),
+                "fallback_runtime": str(getattr(turn, "fallback_runtime", "") or ""),
+            },
         )
 
     def _progress_callback(
@@ -1151,7 +1237,76 @@ class ClaudeCommandService:
         ]
         if matches:
             return sorted(matches, key=lambda record: getattr(record, "started_at", 0) or 0)[0]
+        local = self._local_session_record(task_key, thread_id)
+        if local is not None:
+            return local
         return self._registry.get(task_key=task_key)
+
+    def _local_session_records(
+        self,
+        request: CommandRequest,
+        task_key: str,
+        *,
+        include_all: bool,
+        workspace_query: str,
+        limit: int,
+    ) -> list[Any]:
+        cwd = "" if include_all or workspace_query else self._workspace_for(request, task_key)
+        try:
+            sessions = self._local_sessions.list_recent(limit=limit, cwd=cwd)
+        except Exception:
+            logger.debug("Claude local session scan failed", exc_info=True)
+            return []
+        records = [
+            self._record_from_local_session(task_key, session)
+            for session in sessions
+            if session.session_id
+        ]
+        if workspace_query:
+            records = [
+                record
+                for record in records
+                if workspace_query
+                in (
+                    f"{getattr(record, 'workspace', '')} "
+                    f"{self._workspace_label(str(getattr(record, 'workspace', '') or ''))}"
+                ).lower()
+            ]
+        return records
+
+    def _local_session_record(self, task_key: str, thread_id: str) -> Any | None:
+        try:
+            session = self._local_sessions.get(thread_id)
+        except Exception:
+            logger.debug("Claude local session lookup failed", exc_info=True)
+            return None
+        if session is None:
+            return None
+        return self._record_from_local_session(task_key, session)
+
+    @staticmethod
+    def _record_from_local_session(task_key: str, session: ClaudeLocalSession) -> Any:
+        updated_at = _timestamp_from_iso(session.updated_at)
+        started_at = _timestamp_from_iso(session.created_at) or updated_at
+        return SimpleNamespace(
+            task_id=f"local:{session.session_id}",
+            task_key=task_key,
+            status="completed",
+            workspace=session.cwd,
+            thread_id=session.session_id,
+            turn_id="",
+            model="",
+            permission_mode=session.permission_mode or DEFAULT_CLAUDE_PERMISSION_MODE,
+            title=session.title,
+            started_at=started_at or time.time(),
+            updated_at=updated_at or time.time(),
+            completed_at=updated_at or None,
+            last_message="Claude 本地会话，可接续",
+            token_usage={},
+            recent_events=[],
+            source="claude_local",
+            source_path=session.source_path,
+        )
 
     @staticmethod
     def _dedupe_session_records(records: list[Any]) -> list[Any]:
@@ -1210,6 +1365,22 @@ def _redact_status_internal_ids(text: str, record: Any) -> str:
             redacted = redacted.replace(value, "当前会话")
             redacted = redacted.replace(value[:8], "当前会话")
     return redacted
+
+
+def _is_local_session_record(record: Any) -> bool:
+    return bool(record is not None and getattr(record, "source", "") == "claude_local")
+
+
+def _timestamp_from_iso(value: str) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return 0.0
 
 
 _DEFAULT_SERVICE: ClaudeCommandService | None = None

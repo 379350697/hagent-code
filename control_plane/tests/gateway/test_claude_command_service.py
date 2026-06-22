@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 import time
 
@@ -14,7 +15,7 @@ from gateway.control_planes.claude.event_store import (
 )
 from gateway.control_planes.claude.formatting import format_failure
 from gateway.control_planes.claude.narrator import ClaudeFieldNarrator
-from gateway.control_planes.claude.doctor import DoctorCheck
+from gateway.control_planes.claude.doctor import DoctorCheck, format_doctor_checks
 
 
 class FakeClaudeSession:
@@ -28,7 +29,12 @@ class FakeClaudeSession:
         permission_mode="acceptEdits",
         model="",
         effort="",
+        runtime="",
+        runtime_fallback="",
+        sdk_profile_config=None,
+        **kwargs,
     ):
+        del kwargs
         self.cwd = cwd
         self.approval_callback = approval_callback
         self.config_overrides = list(config_overrides or [])
@@ -36,6 +42,9 @@ class FakeClaudeSession:
         self.permission_mode = permission_mode
         self.model = model
         self.effort = effort
+        self.runtime = runtime
+        self.runtime_fallback = runtime_fallback
+        self.sdk_profile_config = dict(sdk_profile_config or {})
         self.thread_id = resume_thread_id or f"claude-thread-{cwd.rsplit('/', 1)[-1] or 'root'}"
         self.session_id = self.thread_id
         self.interrupted = False
@@ -113,6 +122,27 @@ class FailedTurnClaudeSession(FakeClaudeSession):
             error="Claude turn timed out after 600.0s (hard)",
             interrupted=False,
             should_retire=True,
+            turn_id=f"turn-{self.turns}",
+            session_id=self.thread_id,
+            token_usage_total={},
+        )
+
+
+class WarningTurnClaudeSession(FakeClaudeSession):
+    def run_turn(self, user_input, **options):
+        self.turns += 1
+        self.inputs.append(user_input)
+        self.run_turn_options.append(dict(options))
+        return SimpleNamespace(
+            final_text="gold is 2300",
+            error=None,
+            warning="Claude returned a successful result event, but the CLI process exited with status 1.",
+            error_kind="success_result_then_exit_1",
+            exit_status=1,
+            api_retry_count=3,
+            raw_output_tail=["{\"type\":\"system\",\"subtype\":\"api_retry\"}"],
+            interrupted=False,
+            should_retire=False,
             turn_id=f"turn-{self.turns}",
             session_id=self.thread_id,
             token_usage_total={},
@@ -243,6 +273,7 @@ def _service(
     registry=None,
     selected_store=None,
     event_store=None,
+    local_session_index=None,
 ):
     from gateway.control_planes.claude import service as service_mod
 
@@ -254,6 +285,7 @@ def _service(
         selected_store=selected_store or MemorySelectedStore(),
         session_factory=session_factory,
         event_store=event_store or ClaudeRuntimeEventStore(str(tmp_path / "events.sqlite3")),
+        local_session_index=local_session_index,
     )
 
 
@@ -376,6 +408,24 @@ async def test_claude_new_session_creates_record_and_progress_events(
 
 
 @pytest.mark.asyncio
+async def test_claude_new_defaults_to_sdk_runtime_profile(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENCODEGO_API_KEY", "sk-test")
+    service = _service(tmp_path, monkeypatch)
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new sdk task", workspace="/repo")
+    )
+    live = service._sessions.peek("discord:42:main")
+
+    assert result.status == "completed"
+    assert live is not None
+    assert live.runtime == "agent_sdk"
+    assert live.runtime_fallback == "cli"
+    assert live.sdk_profile == "opencodego"
+    assert live.session.runtime == "agent_sdk"
+    assert live.session.sdk_profile_config["name"] == "opencodego"
+
+
+@pytest.mark.asyncio
 async def test_claude_new_session_persists_real_session_id_after_first_turn(
     tmp_path, monkeypatch
 ) -> None:
@@ -411,6 +461,26 @@ async def test_claude_failed_turn_marks_record_failed(tmp_path, monkeypatch) -> 
     assert record is not None
     assert record.status == "failed"
     assert "timed out" in record.last_message.lower() or "超时" in record.last_message
+
+
+@pytest.mark.asyncio
+async def test_claude_success_result_then_exit_warning_stays_completed(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, WarningTurnClaudeSession)
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new gold price", workspace="/repo")
+    )
+    assert result.status == "completed"
+    assert "gold is 2300" in result.text
+    assert "提醒" in result.text
+    assert result.diagnostics["error_kind"] == "success_result_then_exit_1"
+    events = service._event_store.tail(
+        task_key="discord:42:main",
+        task_id=result.task_id,
+        limit=10,
+    )
+    terminal = next(event for event in events if event.event_type == "turn.completed")
+    assert terminal.payload["error_kind"] == "success_result_then_exit_1"
+    assert terminal.payload["api_retry_count"] == 3
 
 
 @pytest.mark.asyncio
@@ -570,6 +640,7 @@ async def test_claude_doctor_runs_checks(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch)
     repo = _make_git_repo(tmp_path / "repo")
     monkeypatch.setenv("HERMES_CLAUDE_WORKSPACE_ROOTS", str(tmp_path))
+    monkeypatch.setenv("HERMES_CLAUDE_DOCTOR_SMOKE", "0")
     result = await service.handle(
         CommandRequest(
             platform="discord",
@@ -586,6 +657,7 @@ async def test_claude_doctor_runs_checks(tmp_path, monkeypatch) -> None:
 def test_claude_doctor_uses_shared_binary_resolver(tmp_path, monkeypatch) -> None:
     from gateway.control_planes.claude import doctor as doctor_mod
 
+    monkeypatch.setenv("HERMES_CLAUDE_DOCTOR_SMOKE", "0")
     fake_claude = tmp_path / "claude"
     fake_claude.write_text("#!/usr/bin/env sh\necho '2.1.185 (Claude Code)'\n")
     fake_claude.chmod(0o755)
@@ -606,6 +678,45 @@ def test_claude_doctor_uses_shared_binary_resolver(tmp_path, monkeypatch) -> Non
     assert cli.detail == str(fake_claude)
     assert version.status == "pass"
     assert "Claude Code" in version.detail
+
+
+def test_claude_doctor_format_hides_internal_details() -> None:
+    text = format_doctor_checks([
+        DoctorCheck(
+            "Claude SDK",
+            "pass",
+            "profile=opencodego; base_url=http://127.0.0.1:15721/; "
+            "model=glm-5.2; key_source=~/.claude/settings.json",
+        ),
+        DoctorCheck(
+            "Claude CLI",
+            "pass",
+            "/home/wl/.vscode/extensions/anthropic.claude-code/resources/native-binary/claude",
+        ),
+        DoctorCheck("Claude 版本", "pass", "2.1.185 (Claude Code)"),
+        DoctorCheck(
+            "运行配置",
+            "pass",
+            "runtime=agent_sdk; fallback=cli; profile=opencodego; "
+            "model=glm-5.2; permission_mode=bypassPermissions; "
+            "turn_timeout=1800s; idle_timeout=600s",
+        ),
+        DoctorCheck("Claude SDK smoke test", "pass", "OK"),
+        DoctorCheck("工作区", "pass", "/home/wl/projects/hagent-code"),
+        DoctorCheck("事件库", "pass", "/home/wl/.hermes/claude-control-plane/events.sqlite3; 最近事件 1 条"),
+        DoctorCheck("当前会话", "pass", "8388ca05 · /home/wl/projects/hagent-code"),
+        DoctorCheck("会话隔离键", "pass", "discord:1478651348596818023:main"),
+    ])
+
+    assert "Claude 可用性" in text
+    assert "SDK 已连接" in text
+    assert "运行模式" in text
+    assert "短任务测试" in text
+    assert "事件库" not in text
+    assert "会话隔离键" not in text
+    assert "base_url" not in text
+    assert "key_source" not in text
+    assert "native-binary/claude" not in text
 
 
 def test_claude_failure_format_localizes_timeout() -> None:
@@ -699,6 +810,47 @@ async def test_claude_sessions_verbose_shows_thread_id_prefix(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_claude_sessions_include_local_claude_jsonl_sessions(tmp_path, monkeypatch) -> None:
+    from gateway.control_planes.claude.local_sessions import ClaudeLocalSessionIndex
+
+    repo = _make_git_repo(tmp_path / "repo")
+    session_dir = tmp_path / "claude-home" / "projects" / "repo"
+    session_dir.mkdir(parents=True)
+    session_file = session_dir / "local-session-1.jsonl"
+    session_file.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": "local-session-1",
+                "timestamp": "2026-06-22T01:02:03+00:00",
+                "cwd": str(repo),
+                "message": {"content": [{"type": "text", "text": "local task title"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    service = _service(
+        tmp_path,
+        monkeypatch,
+        local_session_index=ClaudeLocalSessionIndex(tmp_path / "claude-home"),
+    )
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="sessions",
+            workspace=str(repo),
+        )
+    )
+
+    assert result.status == "ok"
+    assert "local task title" in result.text
+    assert result.diagnostics["sessions"][0]["thread_id"] == "local-session-1"
+
+
+@pytest.mark.asyncio
 async def test_claude_select_by_index_sets_selected_session(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch)
     first = await service.handle(
@@ -712,6 +864,49 @@ async def test_claude_select_by_index_sets_selected_session(tmp_path, monkeypatc
     selected = service._selected_store.get("discord:42:main")
     assert selected is not None
     assert selected.task_id == first.task_id
+
+
+@pytest.mark.asyncio
+async def test_claude_resume_local_jsonl_session_creates_hermes_record(tmp_path, monkeypatch) -> None:
+    from gateway.control_planes.claude.local_sessions import ClaudeLocalSessionIndex
+
+    repo = _make_git_repo(tmp_path / "repo")
+    session_dir = tmp_path / "claude-home" / "projects" / "repo"
+    session_dir.mkdir(parents=True)
+    (session_dir / "local-session-2.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": "local-session-2",
+                "timestamp": "2026-06-22T01:02:03+00:00",
+                "cwd": str(repo),
+                "title": "local resumable session",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    service = _service(
+        tmp_path,
+        monkeypatch,
+        local_session_index=ClaudeLocalSessionIndex(tmp_path / "claude-home"),
+    )
+
+    result = await service.handle(
+        CommandRequest(
+            platform="discord",
+            chat_id="42",
+            text="resume 1 follow up",
+            workspace=str(repo),
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.thread_id == "local-session-2"
+    assert "local:" not in result.task_id
+    record = service._registry.get(task_key="discord:42:main")
+    assert record is not None
+    assert record.thread_id == "local-session-2"
 
 
 @pytest.mark.asyncio

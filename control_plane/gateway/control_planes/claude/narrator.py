@@ -83,13 +83,40 @@ class ClaudeFieldNarrator:
             )
         if event_type == "turn.failed":
             error = _one_line(_localize_runtime_error(str(payload.get("error") or "未知错误")), 160)
+            if str(payload.get("error_kind") or "") == "api_retry_non_zero_exit":
+                return ClaudeNarration(
+                    "这轮 Claude 上游 API 连续重试后失败了，不是 Hermes 找不到 CLI。",
+                    importance="critical",
+                    evidence=[error] if error else [],
+                    dedupe_key="turn_failed_api_retry",
+                )
             return ClaudeNarration(
                 "这轮 Claude CLI 断流了，我已中断本轮，下一轮会从干净状态继续。",
                 importance="critical",
                 evidence=[error] if error else [],
                 dedupe_key="turn_failed",
             )
+        if event_type == "runtime.fallback":
+            target = str(payload.get("to") or "cli")
+            reason = _one_line(_localize_runtime_error(str(payload.get("reason") or "")), 160)
+            return ClaudeNarration(
+                f"Claude SDK 主链路不可用，已自动回退到 {target}。",
+                importance="high",
+                evidence=[reason] if reason else [],
+                dedupe_key="runtime_fallback",
+            )
         if event_type == "turn.completed" or event_type == "progress.turn_completed":
+            if str(payload.get("error_kind") or "") == "success_result_then_exit_1":
+                warning = _one_line(
+                    _localize_runtime_error(str(payload.get("warning") or "")),
+                    160,
+                )
+                return ClaudeNarration(
+                    "Claude 已返回成功结果，但 CLI 最后退出码异常；我保留结果并记录提醒。",
+                    importance="high",
+                    evidence=[warning] if warning else [f"会话 {short_thread}"],
+                    dedupe_key="turn_completed_with_warning",
+                )
             return ClaudeNarration(
                 "这轮 Claude 已经收尾，最终结果马上发出来。",
                 importance="high",
@@ -147,6 +174,7 @@ class ClaudeFieldNarrator:
             "turn.failed",
             "turn.unconfirmed",
             "task.recoverable_stale",
+            "runtime.fallback",
         }
         for event in reversed(events):
             if event.event_type not in terminal_priority:

@@ -61,6 +61,10 @@ _prepend_package_path(
     "agent.transports",
     ROOT / "hermes_overlay" / "agent" / "transports",
 )
+sys.modules.pop("agent.transports.claude_cli_session", None)
+sys.modules.pop("agent.transports.claude_runtime", None)
+sys.modules.pop("agent.transports.claude_runtime_factory", None)
+sys.modules.pop("agent.transports.claude_agent_sdk_session", None)
 _prepend_package_path(
     "plugins.platforms.discord",
     ROOT / "hermes_overlay" / "plugins" / "platforms" / "discord",

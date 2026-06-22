@@ -225,6 +225,7 @@ def test_claude_uses_native_subcommands(adapter):
         "new",
         "continue",
         "status",
+        "session",
         "sessions",
         "events",
         "doctor",
@@ -256,6 +257,7 @@ async def test_claude_new_and_continue_dispatch_canonical_usage(adapter):
 
     await claude_children["new"].callback(interaction, task="fix discord menu")
     await claude_children["continue"].callback(interaction, task="ship the follow-up")
+    await claude_children["session"].callback(interaction, session="1")
 
     assert adapter._run_simple_slash.await_args_list[0].args == (
         interaction,
@@ -267,6 +269,11 @@ async def test_claude_new_and_continue_dispatch_canonical_usage(adapter):
         "/claude continue ship the follow-up",
     )
     assert adapter._run_simple_slash.await_args_list[1].kwargs == {"echo": True}
+    assert adapter._run_simple_slash.await_args_list[2].args == (
+        interaction,
+        "/claude session 1",
+    )
+    assert adapter._run_simple_slash.await_args_list[2].kwargs == {"echo": True}
 
 
 @pytest.mark.asyncio

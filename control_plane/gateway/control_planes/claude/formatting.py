@@ -26,6 +26,20 @@ def format_failure(prefix: str, error: Any) -> str:
         )
     if "timed out" in lowered or "timeout" in lowered or "超时" in message:
         return f"Claude 任务超时：{message}"
+    if "api retries were exhausted" in lowered:
+        return f"Claude 上游 API 连续重试后失败：{message}"
+    if "claude-agent-sdk is not installed" in lowered or "sdk_dependency_missing" in lowered:
+        return f"Claude SDK 依赖缺失：{message}"
+    if "has no api key" in lowered or "sdk_auth_error" in lowered:
+        return f"Claude SDK 认证配置不完整：{message}"
+    if "sdk_rate_limit" in lowered or "rate limited" in lowered:
+        return f"Claude SDK 上游限流：{message}"
+    if "sdk_connection" in lowered:
+        return f"Claude SDK 连接失败：{message}"
+    if "successful result event" in lowered and "exited with status" in lowered:
+        return f"Claude 已返回成功结果，但 CLI 退出码异常：{message}"
+    if "exited with status" in lowered:
+        return f"Claude CLI 退出码异常：{message}"
     if "permission" in lowered and "mode" in lowered:
         return f"Claude 权限模式问题：{message}"
     return f"{_localize_prefix(prefix)}：{message}"
@@ -95,6 +109,11 @@ def _localize_message(message: str) -> str:
         "Claude: turn completed": "Claude 已完成本轮",
         "Claude: turn interrupted": "Claude 本轮已中断",
         "Claude stop requested.": "已请求停止 Claude。",
+        "Claude API retries were exhausted before the CLI exited": "Claude 上游 API 连续重试后 CLI 退出",
+        "Claude CLI exited with status": "Claude CLI 退出码",
+        "Claude returned a successful result event, but the CLI process exited": "Claude 已返回成功结果，但 CLI 进程退出码异常",
+        "Claude SDK unavailable; fell back to cli.": "Claude SDK 不可用，已回退到 CLI。",
+        "claude-agent-sdk is not installed": "claude-agent-sdk 未安装",
         "unknown error": "未知错误",
         "turn timed out": "本轮超时",
         "binary not found": "未找到 Claude CLI",

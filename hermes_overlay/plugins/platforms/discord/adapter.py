@@ -3898,6 +3898,13 @@ class DiscordAdapter(BasePlatformAdapter):
         async def _claude_sessions(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/claude sessions", echo=True)
 
+        @claude_group.command(name="session", description="列出或选择 Claude 会话")
+        async def _claude_session(interaction: discord.Interaction, session: str = ""):
+            command = "/claude session"
+            if session:
+                command = f"{command} {session}"
+            await self._run_simple_slash(interaction, command, echo=True)
+
         @claude_group.command(name="events", description="查看当前 Claude 会话事件")
         async def _claude_events(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/claude events", echo=True)

@@ -18,7 +18,10 @@ control_plane/tests/gateway/test_claude_control_architecture.py
 
 ```text
 hermes_overlay/agent/transports/codex_app_server_session.py
+hermes_overlay/agent/transports/claude_agent_sdk_session.py
 hermes_overlay/agent/transports/claude_cli_session.py
+hermes_overlay/agent/transports/claude_runtime.py
+hermes_overlay/agent/transports/claude_runtime_factory.py
 hermes_overlay/gateway/slash_commands.py
 hermes_overlay/gateway/run.py
 hermes_overlay/gateway/platforms/api_server.py
