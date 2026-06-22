@@ -4840,6 +4840,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return scheduled
 
+    def _sweep_claude_control_plane_on_startup(self) -> int:
+        """Close orphan Claude control-plane turns from the previous gateway.
+
+        /claude services are usually created lazily when the first command is
+        invoked. A gateway restart can kill an in-flight Claude turn before
+        that lazy service writes a terminal record, so startup eagerly
+        reconciles the persistent registry.
+        """
+        try:
+            from gateway.control_planes.claude import get_claude_command_service
+
+            service = get_claude_command_service()
+            changed = service.sweep_stale_tasks(startup=True)
+            if changed:
+                logger.warning(
+                    "Reconciled %d orphan Claude task(s) after gateway startup",
+                    changed,
+                )
+            return int(changed or 0)
+        except Exception:
+            logger.debug("Claude control-plane startup sweep failed", exc_info=True)
+            return 0
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -5044,6 +5067,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "shell-hook registration failed at gateway startup",
                 exc_info=True,
             )
+
+        self._sweep_claude_control_plane_on_startup()
 
         # Discover and load event hooks
         self.hooks.discover_and_load()

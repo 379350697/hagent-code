@@ -16,6 +16,7 @@ from gateway.control_planes.claude.event_store import (
 from gateway.control_planes.claude.formatting import format_failure
 from gateway.control_planes.claude.narrator import ClaudeFieldNarrator
 from gateway.control_planes.claude.doctor import DoctorCheck, format_doctor_checks
+from gateway.control_planes.claude.records import make_task_record
 
 
 class FakeClaudeSession:
@@ -372,14 +373,14 @@ async def test_claude_continue_updates_existing_session_record(tmp_path, monkeyp
     assert len(service._registry.records) == 1
     record = service._registry.get(task_id=first.task_id)
     assert record is not None
-    assert record.title == "456"
-    assert "任务：456" in status.text
-    assert "任务：123" not in status.text
+    assert record.title == "123"
+    assert "任务：123" in status.text
+    assert "任务：456" not in status.text
     assert "轮次：turn-2" in status.text
     assert first.task_id not in status.text
     assert first.thread_id not in status.text
-    assert "456" in sessions.text
-    assert "123" not in sessions.text
+    assert "123" in sessions.text
+    assert "456" not in sessions.text
     assert first.thread_id[:8] not in sessions.text
 
 
@@ -513,6 +514,108 @@ async def test_claude_runtime_events_are_persisted_and_queryable(
     )
     assert events
     assert any(event.event_type == "turn.completed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_claude_startup_sweep_interrupts_orphan_running_record(
+    tmp_path, monkeypatch
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    record = make_task_record(
+        task_id="task-orphan",
+        task_key="discord:42:main",
+        status="running",
+        workspace="/repo",
+        thread_id="claude-thread-orphan",
+        turn_id="",
+        model="glm-5.2",
+        permission_mode="bypassPermissions",
+        prompt="deploy task",
+        last_message="Claude: turn started",
+    )
+    service._registry.upsert(record)
+
+    changed = service.sweep_stale_tasks(startup=True)
+    record = service._registry.get(task_id="task-orphan")
+    events = service._event_store.tail(
+        task_key="discord:42:main",
+        task_id="task-orphan",
+        limit=10,
+    )
+
+    assert changed == 1
+    assert record is not None
+    assert record.status == "interrupted"
+    assert "gateway restart" in record.last_message
+    interrupted = next(event for event in events if event.event_type == "turn.interrupted")
+    assert interrupted.payload["error_kind"] == "gateway_startup_without_live_turn"
+
+
+@pytest.mark.asyncio
+async def test_claude_status_marks_stale_running_record_interrupted(
+    tmp_path, monkeypatch
+) -> None:
+    from gateway.control_planes.claude import service as service_mod
+
+    service = _service(tmp_path, monkeypatch)
+    monkeypatch.setattr(service_mod, "load_claude_cfg", lambda: {"stale_running_seconds": 1})
+    record = make_task_record(
+        task_id="task-stale",
+        task_key="discord:42:main",
+        status="running",
+        workspace="/repo",
+        thread_id="claude-thread-stale",
+        turn_id="",
+        model="glm-5.2",
+        permission_mode="bypassPermissions",
+        prompt="deploy task",
+        last_message="Claude: turn started",
+    )
+    service._registry.upsert(record)
+    service._registry.records["task-stale"].updated_at = time.time() - 5
+
+    status = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="status", workspace="/repo")
+    )
+    record = service._registry.get(task_id="task-stale")
+
+    assert status.status == "interrupted"
+    assert record is not None
+    assert record.status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_claude_status_recovers_terminal_event_for_running_record(
+    tmp_path, monkeypatch
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    result = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="new deploy task", workspace="/repo")
+    )
+    service._registry.update(
+        result.task_id,
+        status="running",
+        completed_at=None,
+        last_message="Claude: turn started",
+    )
+    service._event_store.append(
+        task_key="discord:42:main",
+        task_id=result.task_id,
+        thread_id=result.thread_id,
+        turn_id="turn-terminal",
+        event_type="turn.completed",
+        payload={"status": "completed"},
+    )
+
+    status = await service.handle(
+        CommandRequest(platform="discord", chat_id="42", text="status", workspace="/repo")
+    )
+    record = service._registry.get(task_id=result.task_id)
+
+    assert status.status == "completed"
+    assert record is not None
+    assert record.status == "completed"
+    assert record.turn_id == "turn-terminal"
 
 
 @pytest.mark.asyncio

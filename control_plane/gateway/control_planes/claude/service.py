@@ -34,9 +34,12 @@ from .runtime_config import (
     claude_cli_config_overrides,
     claude_runtime,
     claude_runtime_fallback,
+    claude_stale_running_seconds,
     claude_sdk_profile_name,
     claude_cli_turn_options,
     claude_permission_profiles,
+    claude_watchdog_interval_seconds,
+    claude_watchdog_scan_limit,
     load_claude_cfg,
     normalize_permission_mode,
     normalize_permission_profile,
@@ -69,6 +72,7 @@ class ClaudeCommandService:
         event_store: Any = None,
         narrator: ClaudeFieldNarrator | None = None,
         local_session_index: ClaudeLocalSessionIndex | None = None,
+        start_watchdog: bool | None = None,
     ) -> None:
         if registry is None:
             registry = ClaudeTaskRegistry()
@@ -79,6 +83,20 @@ class ClaudeCommandService:
         self._event_store = event_store or ClaudeRuntimeEventStore()
         self._narrator = narrator or ClaudeFieldNarrator()
         self._local_sessions = local_session_index or ClaudeLocalSessionIndex()
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        if start_watchdog is None:
+            start_watchdog = (
+                isinstance(self._registry, ClaudeTaskRegistry)
+                and os.environ.get("HERMES_CLAUDE_WATCHDOG", "1").strip().lower()
+                not in {"0", "false", "no", "off"}
+            )
+        if start_watchdog:
+            try:
+                self.sweep_stale_tasks(startup=True)
+            except Exception:
+                logger.debug("Claude startup stale sweep failed", exc_info=True)
+            self._start_watchdog()
 
     async def handle(self, request: CommandRequest) -> CommandResult:
         raw_args = (request.text or "").strip()
@@ -286,6 +304,7 @@ class ClaudeCommandService:
         record = self._selected_or_latest_record(task_key)
         if record is None:
             return CommandResult("还没有 Claude 任务记录。", status="not_found")
+        record = self._reconcile_status_record(record, task_key)
         text = format_task_status(
             record,
             verbose=self._can_show_all_sessions(request),
@@ -314,6 +333,179 @@ class ClaudeCommandService:
             task_id=str(getattr(record, "task_id", "") or ""),
             thread_id=str(getattr(record, "thread_id", "") or ""),
         )
+
+    def _reconcile_status_record(
+        self,
+        record: Any,
+        task_key: str,
+        *,
+        claude_cfg: dict[str, Any] | None = None,
+        startup: bool = False,
+    ) -> Any:
+        status = str(getattr(record, "status", "") or "")
+        if status not in {"starting", "planning", "running", "busy"}:
+            return record
+        task_id = str(getattr(record, "task_id", "") or "")
+        thread_id = str(getattr(record, "thread_id", "") or "")
+        if not task_id or not thread_id:
+            return record
+
+        terminal = self._latest_terminal_event(task_key, task_id, thread_id)
+        if terminal is not None:
+            terminal_status = {
+                "turn.completed": "completed",
+                "turn.failed": "failed",
+                "turn.interrupted": "interrupted",
+            }.get(terminal.event_type)
+            if terminal_status:
+                payload = terminal.payload if isinstance(terminal.payload, dict) else {}
+                message = (
+                    str(payload.get("error") or payload.get("warning") or "")
+                    if isinstance(payload, dict)
+                    else ""
+                )
+                last_message = {
+                    "completed": "Claude: turn completed",
+                    "failed": message or "Claude: turn failed",
+                    "interrupted": "Claude: turn interrupted",
+                }.get(terminal_status, "Claude: turn ended")
+                updated = self._registry.update(
+                    task_id,
+                    status=terminal_status,
+                    turn_id=str(getattr(terminal, "turn_id", "") or getattr(record, "turn_id", "") or ""),
+                    completed_at=time.time(),
+                    last_message=last_message,
+                )
+                return updated or record
+
+        live = self._sessions.peek(task_key)
+        if live is not None and live.lock.locked():
+            return record
+
+        cfg = claude_cfg if isinstance(claude_cfg, dict) else load_claude_cfg()
+        stale_after = claude_stale_running_seconds(cfg)
+        updated_at = float(getattr(record, "updated_at", None) or 0.0)
+        stale = bool(updated_at and (time.time() - updated_at) >= stale_after)
+        if not startup and not stale:
+            return record
+
+        reason = (
+            "gateway_startup_without_live_turn"
+            if startup
+            else "running_record_without_live_turn"
+        )
+        last_message = (
+            "Claude turn was interrupted by gateway restart before Hermes received a terminal result."
+            if startup
+            else "Claude turn is stale: current gateway has no live turn for this running record."
+        )
+        updated = self._registry.update(
+            task_id,
+            status="interrupted",
+            completed_at=time.time(),
+            last_message=last_message,
+        )
+        self._append_runtime_event(
+            task_key=task_key,
+            task_id=task_id,
+            thread_id=thread_id,
+            turn_id=str(getattr(record, "turn_id", "") or ""),
+            event_type="turn.interrupted",
+            payload={
+                "status": "interrupted",
+                "error_kind": reason,
+                "message": last_message,
+                "stale_after_seconds": stale_after,
+                "startup_reconcile": startup,
+            },
+            workspace=str(getattr(record, "workspace", "") or ""),
+        )
+        return updated or record
+
+    def _latest_terminal_event(
+        self,
+        task_key: str,
+        task_id: str,
+        thread_id: str,
+    ) -> Any | None:
+        try:
+            events = self._event_store.tail(
+                task_key=task_key,
+                task_id=task_id,
+                thread_id=thread_id,
+                limit=50,
+            )
+        except Exception:
+            logger.debug("Claude terminal event lookup failed", exc_info=True)
+            return None
+        for event in reversed(events):
+            if getattr(event, "event_type", "") in {
+                "turn.completed",
+                "turn.failed",
+                "turn.interrupted",
+            }:
+                return event
+        return None
+
+    def sweep_stale_tasks(
+        self,
+        *,
+        limit: int | None = None,
+        startup: bool = False,
+    ) -> int:
+        claude_cfg = load_claude_cfg()
+        scan_limit = limit or claude_watchdog_scan_limit(claude_cfg)
+        try:
+            records = self._registry.list(limit=scan_limit)
+        except TypeError:
+            records = self._registry.list()
+        except Exception:
+            logger.debug("Claude watchdog registry list failed", exc_info=True)
+            return 0
+        changed = 0
+        for record in records:
+            before = (
+                str(getattr(record, "status", "") or ""),
+                str(getattr(record, "turn_id", "") or ""),
+                str(getattr(record, "last_message", "") or ""),
+            )
+            updated = self._reconcile_status_record(
+                record,
+                str(getattr(record, "task_key", "") or ""),
+                claude_cfg=claude_cfg,
+                startup=startup,
+            )
+            after = (
+                str(getattr(updated, "status", "") or ""),
+                str(getattr(updated, "turn_id", "") or ""),
+                str(getattr(updated, "last_message", "") or ""),
+            )
+            if after != before:
+                changed += 1
+        return changed
+
+    def _start_watchdog(self) -> None:
+        if self._watchdog_thread is not None:
+            return
+
+        def loop() -> None:
+            while not self._watchdog_stop.is_set():
+                interval = claude_watchdog_interval_seconds(load_claude_cfg())
+                if interval <= 0:
+                    return
+                if self._watchdog_stop.wait(interval):
+                    return
+                try:
+                    self.sweep_stale_tasks()
+                except Exception:
+                    logger.debug("Claude watchdog sweep failed", exc_info=True)
+
+        self._watchdog_thread = threading.Thread(
+            target=loop,
+            name="claude-stale-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
 
     async def _doctor(self, request: CommandRequest, task_key: str) -> CommandResult:
         record = self._selected_or_latest_record(task_key)
@@ -935,7 +1127,6 @@ class ClaudeCommandService:
                 turn_id="",
                 model=model,
                 permission_mode=permission_mode,
-                title=" ".join(prompt.strip().split())[:80],
                 turn_started_at=turn_started_at,
                 completed_at=None,
                 token_usage={},

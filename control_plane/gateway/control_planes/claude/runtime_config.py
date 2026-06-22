@@ -236,6 +236,43 @@ def normalize_permission_mode(value: str) -> str:
     return aliases.get(raw.lower(), raw)
 
 
+def claude_stale_running_seconds(cfg: dict[str, Any] | None = None) -> float:
+    claude_cfg = cfg if isinstance(cfg, dict) else load_claude_cfg()
+    try:
+        value = float(
+            claude_cfg.get(
+                "stale_running_seconds",
+                claude_cfg.get("stale_running_timeout_seconds", 900.0),
+            )
+        )
+    except (TypeError, ValueError):
+        return 900.0
+    return value if value > 0 else 900.0
+
+
+def claude_watchdog_interval_seconds(cfg: dict[str, Any] | None = None) -> float:
+    claude_cfg = cfg if isinstance(cfg, dict) else load_claude_cfg()
+    try:
+        value = float(
+            claude_cfg.get(
+                "stale_watchdog_interval_seconds",
+                claude_cfg.get("watchdog_interval_seconds", 60.0),
+            )
+        )
+    except (TypeError, ValueError):
+        return 60.0
+    return value if value >= 0 else 60.0
+
+
+def claude_watchdog_scan_limit(cfg: dict[str, Any] | None = None) -> int:
+    claude_cfg = cfg if isinstance(cfg, dict) else load_claude_cfg()
+    try:
+        value = int(claude_cfg.get("stale_watchdog_scan_limit", 100))
+    except (TypeError, ValueError):
+        return 100
+    return max(1, value)
+
+
 def claude_permission_profiles() -> dict[str, dict[str, str]]:
     """Claude permission mode profiles mirroring codex permission profiles."""
     return {
