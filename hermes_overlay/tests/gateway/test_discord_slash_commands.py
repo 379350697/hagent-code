@@ -20,6 +20,15 @@ def _ensure_discord_mock():
 
         return decorator
 
+    def _fake_describe(**kwargs):
+        def decorator(fn):
+            existing = dict(getattr(fn, "__descriptions__", {}) or {})
+            existing.update(kwargs)
+            fn.__descriptions__ = existing
+            return fn
+
+        return decorator
+
     discord_mod = MagicMock()
     discord_mod.Intents.default.return_value = MagicMock()
     discord_mod.DMChannel = type("DMChannel", (), {})
@@ -60,9 +69,10 @@ def _ensure_discord_mock():
             self.callback = callback
             self.parent = parent
             self.autocomplete = getattr(callback, "__autocomplete__", {})
+            self.descriptions = getattr(callback, "__descriptions__", {})
 
     discord_mod.app_commands = SimpleNamespace(
-        describe=lambda **kwargs: (lambda fn: fn),
+        describe=_fake_describe,
         choices=lambda **kwargs: (lambda fn: fn),
         autocomplete=_fake_autocomplete,
         Choice=lambda **kwargs: SimpleNamespace(**kwargs),
@@ -100,6 +110,7 @@ def _ensure_discord_mock():
                         callback=fn,
                         parent=self,
                         autocomplete=getattr(fn, "__autocomplete__", {}),
+                        descriptions=getattr(fn, "__descriptions__", {}),
                     )
                     self.add_command(command)
                     return fn
@@ -298,6 +309,42 @@ async def test_simple_slash_defer_failure_does_not_dispatch(adapter):
 
 
 @pytest.mark.asyncio
+async def test_simple_slash_sends_preface_after_defer(adapter):
+    """A caller-provided preface is sent after defer as a plain channel message."""
+    defer_mock = AsyncMock()
+    sends = []
+
+    class _Chan:
+        async def send(self, content):
+            sends.append(content)
+
+    adapter.handle_message = AsyncMock()
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=defer_mock),
+        channel=_Chan(),
+        channel_id=123,
+        user=SimpleNamespace(display_name="0xLL", name="0xLL", id=42),
+        guild_id=99,
+    )
+
+    await adapter._run_simple_slash(
+        interaction,
+        "/codex continue 继续执行",
+        echo=True,
+        preface="> 📍 当前：wlcodex · 任务标题",
+    )
+
+    # defer happened (the precondition for the deadline-safe send).
+    defer_mock.assert_awaited_once()
+    # preface was delivered as a plain channel message.
+    assert "> 📍 当前：wlcodex · 任务标题" in sends
+    # the echo "下达任务" line was also delivered.
+    assert any("下达任务" in s for s in sends)
+    # and the command dispatched.
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_codex_registers_diagnostics_subcommands(adapter):
     adapter._run_simple_slash = AsyncMock()
     adapter._register_slash_commands()
@@ -317,108 +364,44 @@ async def test_codex_registers_diagnostics_subcommands(adapter):
 
 
 @pytest.mark.asyncio
-async def test_codex_continue_has_no_autocomplete_and_posts_context(adapter, monkeypatch):
-    """`/codex continue` must NOT use autocomplete (no filter dropdown). The
-    current workspace · session title is shown as a plain context message
-    before the task is dispatched."""
-    from gateway.control_planes import codex as codex_pkg
-
-    record = SimpleNamespace(
-        workspace="/home/wl/projects/wlcodex",
-        title="看下 web 模式会话流是否真实流式",
-    )
-
-    class FakeService:
-        def _selected_or_latest_record(self, task_key):
-            assert task_key == "discord:42:main"
-            return record
-
-        @staticmethod
-        def _workspace_label(workspace):
-            return workspace.rstrip("/").split("/")[-1]
-
-        @staticmethod
-        def _session_title(record):
-            return record.title
-
-    monkeypatch.setattr(codex_pkg, "get_codex_command_service", lambda: FakeService())
+async def test_codex_continue_prompt_uses_context_description_without_preface(adapter):
+    adapter._run_simple_slash = AsyncMock()
     adapter._register_slash_commands()
 
     codex = adapter._client.tree.commands["codex"]
     continue_cmd = getattr(codex, "_children", {})["continue"]
 
-    # No autocomplete filter dropdown on the `task` option.
+    assert continue_cmd.descriptions["task"] == "📍 当前：工作区 · 会话标题"
     assert not getattr(continue_cmd, "autocomplete", {})
 
-    channel_send = AsyncMock()
-    interaction = SimpleNamespace(
-        channel=SimpleNamespace(id=42, send=channel_send),
-        channel_id=42,
-    )
-    adapter._run_simple_slash = AsyncMock()
-
+    interaction = SimpleNamespace(channel=SimpleNamespace(id=42), channel_id=42)
     await continue_cmd.callback(interaction, task="继续执行")
 
-    # Context line is posted as a plain message (display only, not a Choice).
-    channel_send.assert_awaited_once()
-    posted = channel_send.await_args.args[0]
-    assert "当前：wlcodex" in posted
-    assert "看下 web 模式会话流是否真实流式" in posted
-    # And the task still dispatches.
     adapter._run_simple_slash.assert_awaited_once_with(
-        interaction, "/codex continue 继续执行", echo=True,
+        interaction,
+        "/codex continue 继续执行",
+        echo=True,
     )
 
 
 @pytest.mark.asyncio
-async def test_claude_continue_has_no_autocomplete_and_posts_context(adapter, monkeypatch):
-    """`/claude continue` must NOT use autocomplete (no filter dropdown). The
-    current workspace · session title is shown as a plain context message
-    before the task is dispatched."""
-    from gateway.control_planes import claude as claude_pkg
-
-    record = SimpleNamespace(
-        workspace="/home/wl/projects/hagent-code",
-        title="检查 Discord 注册菜单",
-    )
-
-    class FakeService:
-        def _selected_or_latest_record(self, task_key):
-            assert task_key == "discord:42:main"
-            return record
-
-        @staticmethod
-        def _workspace_label(workspace):
-            return workspace.rstrip("/").split("/")[-1]
-
-        @staticmethod
-        def _session_title(record):
-            return record.title
-
-    monkeypatch.setattr(claude_pkg, "get_claude_command_service", lambda: FakeService())
+async def test_claude_continue_prompt_uses_context_description_without_preface(adapter):
+    adapter._run_simple_slash = AsyncMock()
     adapter._register_slash_commands()
 
     claude = adapter._client.tree.commands["claude"]
     continue_cmd = getattr(claude, "_children", {})["continue"]
 
-    # No autocomplete filter dropdown on the `task` option.
+    assert continue_cmd.descriptions["task"] == "📍 当前：工作区 · 会话标题"
     assert not getattr(continue_cmd, "autocomplete", {})
 
-    channel_send = AsyncMock()
-    interaction = SimpleNamespace(
-        channel=SimpleNamespace(id=42, send=channel_send),
-        channel_id=42,
-    )
-    adapter._run_simple_slash = AsyncMock()
-
+    interaction = SimpleNamespace(channel=SimpleNamespace(id=42), channel_id=42)
     await continue_cmd.callback(interaction, task="继续修")
 
-    channel_send.assert_awaited_once()
-    posted = channel_send.await_args.args[0]
-    assert "当前：hagent-code" in posted
-    assert "检查 Discord 注册菜单" in posted
     adapter._run_simple_slash.assert_awaited_once_with(
-        interaction, "/claude continue 继续修", echo=True,
+        interaction,
+        "/claude continue 继续修",
+        echo=True,
     )
 
 

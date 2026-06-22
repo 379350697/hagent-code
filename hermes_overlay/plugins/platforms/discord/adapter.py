@@ -3336,6 +3336,7 @@ class DiscordAdapter(BasePlatformAdapter):
         followup_msg: str | None = None,
         *,
         echo: bool = False,
+        preface: str | None = None,
     ) -> None:
         """Common handler for simple slash commands that dispatch a command string.
 
@@ -3346,7 +3347,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
         When *echo* is True the command text is sent as a visible channel
         message so the user can see what they invoked.
+
+        When *preface* is provided it is sent as a visible channel message
+        *after* the interaction is deferred (so it never risks the 3-second
+        interaction deadline) and before the command is dispatched.
         """
+
         # Log the invoker so ghost-command reports can be triaged.  Discord
         # native slash invocations are always user-initiated (no bot can fire
         # them), but mobile autocomplete / keyboard shortcuts / other users
@@ -3393,6 +3399,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 await interaction.channel.send(
                     f"> 📋 **{user_name}** 下达任务：`{command_text}`"
                 )
+            except Exception:
+                pass
+
+        # Optional visible preface, sent after defer (safe re: the 3s
+        # interaction deadline) and before dispatch.
+        if preface and interaction.channel:
+            try:
+                await interaction.channel.send(preface)
             except Exception:
                 pass
 
@@ -3589,53 +3603,9 @@ class DiscordAdapter(BasePlatformAdapter):
         async def _codex_new(interaction: discord.Interaction, task: str):
             await self._run_simple_slash(interaction, f"/codex new {task}", echo=True)
 
-        def _codex_continue_context_label(interaction: "discord.Interaction") -> str:
-            """Build the ``当前：{workspace} · {title}`` context line for /codex continue.
-
-            Shown as a plain channel message before the task runs — displayed,
-            not a searchable/filterable autocomplete option. Returns "" when the
-            context cannot be determined (no selected session).
-            """
-            try:
-                from gateway.control_planes.codex import (
-                    CommandRequest,
-                    build_codex_task_key,
-                    get_codex_command_service,
-                )
-
-                is_thread = isinstance(interaction.channel, discord.Thread)
-                request = CommandRequest(
-                    platform="discord",
-                    chat_id=str(interaction.channel_id),
-                    thread_id=str(interaction.channel_id) if is_thread else "",
-                )
-                service = get_codex_command_service()
-                task_key = build_codex_task_key(request)
-                record = service._selected_or_latest_record(task_key)  # type: ignore[attr-defined]
-                if record is None:
-                    return ""
-                workspace = service._workspace_label(  # type: ignore[attr-defined]
-                    str(getattr(record, "workspace", "") or "")
-                )
-                title = service._session_title(record)  # type: ignore[attr-defined]
-                return f"当前：{workspace} · {title}"
-            except Exception:
-                logger.debug("[%s] Failed to build Codex continue context", self.name, exc_info=True)
-                return ""
-
         @codex_group.command(name="continue", description="继续当前 Codex 会话")
-        @discord.app_commands.describe(task="继续要求（直接输入，无需选择）")
+        @discord.app_commands.describe(task="📍 当前：工作区 · 会话标题")
         async def _codex_continue(interaction: discord.Interaction, task: str):
-            # Show the current workspace · session title as a plain context
-            # line above the dispatched task — displayed only, never a
-            # search/filter dropdown. /codex continue always resumes the
-            # currently-selected session, so there is nothing to pick.
-            label = _codex_continue_context_label(interaction)
-            if label and interaction.channel:
-                try:
-                    await interaction.channel.send(f"> 📍 {label}")
-                except Exception:
-                    pass
             await self._run_simple_slash(interaction, f"/codex continue {task}", echo=True)
 
         @codex_group.command(name="status", description="查看 Codex 会话状态")
@@ -3831,53 +3801,9 @@ class DiscordAdapter(BasePlatformAdapter):
         async def _claude_new(interaction: discord.Interaction, task: str):
             await self._run_simple_slash(interaction, f"/claude new {task}", echo=True)
 
-        def _claude_continue_context_label(interaction: "discord.Interaction") -> str:
-            """Build the ``当前：{workspace} · {title}`` context line for /claude continue.
-
-            Shown as a plain channel message before the task runs — displayed,
-            not a searchable/filterable autocomplete option. Returns "" when the
-            context cannot be determined (no selected session).
-            """
-            try:
-                from gateway.control_planes.claude import (
-                    CommandRequest,
-                    build_claude_task_key,
-                    get_claude_command_service,
-                )
-
-                is_thread = isinstance(interaction.channel, discord.Thread)
-                request = CommandRequest(
-                    platform="discord",
-                    chat_id=str(interaction.channel_id),
-                    thread_id=str(interaction.channel_id) if is_thread else "",
-                )
-                service = get_claude_command_service()
-                task_key = build_claude_task_key(request)
-                record = service._selected_or_latest_record(task_key)  # type: ignore[attr-defined]
-                if record is None:
-                    return ""
-                workspace = service._workspace_label(  # type: ignore[attr-defined]
-                    str(getattr(record, "workspace", "") or "")
-                )
-                title = service._session_title(record)  # type: ignore[attr-defined]
-                return f"当前：{workspace} · {title}"
-            except Exception:
-                logger.debug("[%s] Failed to build Claude continue context", self.name, exc_info=True)
-                return ""
-
         @claude_group.command(name="continue", description="继续当前 Claude 会话")
-        @discord.app_commands.describe(task="继续要求（直接输入，无需选择）")
+        @discord.app_commands.describe(task="📍 当前：工作区 · 会话标题")
         async def _claude_continue(interaction: discord.Interaction, task: str):
-            # Show the current workspace · session title as a plain context
-            # line above the dispatched task — displayed only, never a
-            # search/filter dropdown. /claude continue always resumes the
-            # currently-selected session, so there is nothing to pick.
-            label = _claude_continue_context_label(interaction)
-            if label and interaction.channel:
-                try:
-                    await interaction.channel.send(f"> 📍 {label}")
-                except Exception:
-                    pass
             await self._run_simple_slash(interaction, f"/claude continue {task}", echo=True)
 
         @claude_group.command(name="status", description="查看 Claude 会话状态")
