@@ -279,7 +279,12 @@ async def test_claude_new_and_continue_dispatch_canonical_usage(adapter):
         interaction,
         "/claude continue ship the follow-up",
     )
-    assert adapter._run_simple_slash.await_args_list[1].kwargs == {"echo": True}
+    # continue passes echo=True plus a preface context line (None here because
+    # no service/session is wired up in this registration-only test).
+    assert adapter._run_simple_slash.await_args_list[1].kwargs == {
+        "echo": True,
+        "preface": None,
+    }
     assert adapter._run_simple_slash.await_args_list[2].args == (
         interaction,
         "/claude session 1",
@@ -364,7 +369,10 @@ async def test_codex_registers_diagnostics_subcommands(adapter):
 
 
 @pytest.mark.asyncio
-async def test_codex_continue_autocomplete_shows_real_context_without_preface(adapter, monkeypatch):
+async def test_codex_continue_has_no_autocomplete_and_passes_real_context_preface(adapter, monkeypatch):
+    """/codex continue must NOT use autocomplete (no filter dropdown). The real
+    workspace · session title is passed as `preface` to _run_simple_slash, which
+    sends it AFTER defer as a plain channel message."""
     from gateway.control_planes import codex as codex_pkg
 
     record = SimpleNamespace(
@@ -392,25 +400,29 @@ async def test_codex_continue_autocomplete_shows_real_context_without_preface(ad
     codex = adapter._client.tree.commands["codex"]
     continue_cmd = getattr(codex, "_children", {})["continue"]
 
-    assert continue_cmd.descriptions["task"] == "继续要求（直接输入；候选提示显示当前会话）"
-    autocomplete = continue_cmd.autocomplete["task"]
+    # No autocomplete filter dropdown on the `task` option.
+    assert not getattr(continue_cmd, "autocomplete", {})
+    assert continue_cmd.descriptions["task"] == "继续要求（直接输入，无需选择）"
+
     interaction = SimpleNamespace(channel=SimpleNamespace(id=42), channel_id=42)
-    choices = await autocomplete(interaction, "继续执行")
-
-    assert len(choices) == 1
-    assert choices[0].name == "📍 当前：wlcodex · 看下 web 模式会话流是否真实流式"
-    assert choices[0].value == "继续执行"
-
     await continue_cmd.callback(interaction, task="继续执行")
-    adapter._run_simple_slash.assert_awaited_once_with(
-        interaction,
-        "/codex continue 继续执行",
-        echo=True,
-    )
+
+    adapter._run_simple_slash.assert_awaited_once()
+    args = adapter._run_simple_slash.await_args.args
+    kwargs = adapter._run_simple_slash.await_args.kwargs
+    assert args[0] is interaction
+    assert args[1] == "/codex continue 继续执行"
+    assert kwargs.get("echo") is True
+    # The real workspace · title is passed as the preface context line.
+    preface = kwargs.get("preface")
+    assert preface == "> 📍 当前：wlcodex · 看下 web 模式会话流是否真实流式"
 
 
 @pytest.mark.asyncio
-async def test_claude_continue_autocomplete_shows_real_context_without_preface(adapter, monkeypatch):
+async def test_claude_continue_has_no_autocomplete_and_passes_real_context_preface(adapter, monkeypatch):
+    """/claude continue must NOT use autocomplete (no filter dropdown). The real
+    workspace · session title is passed as `preface` to _run_simple_slash, which
+    sends it AFTER defer as a plain channel message."""
     from gateway.control_planes import claude as claude_pkg
 
     record = SimpleNamespace(
@@ -438,21 +450,21 @@ async def test_claude_continue_autocomplete_shows_real_context_without_preface(a
     claude = adapter._client.tree.commands["claude"]
     continue_cmd = getattr(claude, "_children", {})["continue"]
 
-    assert continue_cmd.descriptions["task"] == "继续要求（直接输入；候选提示显示当前会话）"
-    autocomplete = continue_cmd.autocomplete["task"]
+    # No autocomplete filter dropdown on the `task` option.
+    assert not getattr(continue_cmd, "autocomplete", {})
+    assert continue_cmd.descriptions["task"] == "继续要求（直接输入，无需选择）"
+
     interaction = SimpleNamespace(channel=SimpleNamespace(id=42), channel_id=42)
-    choices = await autocomplete(interaction, "继续修")
-
-    assert len(choices) == 1
-    assert choices[0].name == "📍 当前：hagent-code · 检查 Discord 注册菜单"
-    assert choices[0].value == "继续修"
-
     await continue_cmd.callback(interaction, task="继续修")
-    adapter._run_simple_slash.assert_awaited_once_with(
-        interaction,
-        "/claude continue 继续修",
-        echo=True,
-    )
+
+    adapter._run_simple_slash.assert_awaited_once()
+    args = adapter._run_simple_slash.await_args.args
+    kwargs = adapter._run_simple_slash.await_args.kwargs
+    assert args[0] is interaction
+    assert args[1] == "/claude continue 继续修"
+    assert kwargs.get("echo") is True
+    preface = kwargs.get("preface")
+    assert preface == "> 📍 当前：hagent-code · 检查 Discord 注册菜单"
 
 
 # ------------------------------------------------------------------

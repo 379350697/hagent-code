@@ -3631,24 +3631,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Failed to build Codex continue context", self.name, exc_info=True)
                 return ""
 
-        async def _codex_continue_task_autocomplete(
-            interaction: "discord.Interaction",
-            current: str,
-        ):
-            label = _codex_continue_context_label(interaction)
-            if not label:
-                return []
-            value = current[:100] if str(current or "").strip() else "__hermes_continue_context_hint__"
-            return [discord.app_commands.Choice(name=f"📍 {label}"[:100], value=value)]
-
         @codex_group.command(name="continue", description="继续当前 Codex 会话")
-        @discord.app_commands.describe(task="继续要求（直接输入；候选提示显示当前会话）")
-        @discord.app_commands.autocomplete(task=_codex_continue_task_autocomplete)
+        @discord.app_commands.describe(task="继续要求（直接输入，无需选择）")
         async def _codex_continue(interaction: discord.Interaction, task: str):
-            if task == "__hermes_continue_context_hint__":
-                await interaction.response.send_message("请直接在 task 里输入继续要求，不需要选择提示项。", ephemeral=True)
-                return
-            await self._run_simple_slash(interaction, f"/codex continue {task}", echo=True)
+            # Show the current workspace · session title as a plain context
+            # line above the dispatched task — displayed only, never a
+            # search/filter dropdown. /codex continue always resumes the
+            # currently-selected session, so there is nothing to pick. The
+            # preface is sent by _run_simple_slash *after* defer, so it can
+            # never blow the 3-second interaction deadline.
+            label = _codex_continue_context_label(interaction)
+            preface = f"> 📍 {label}" if label else None
+            await self._run_simple_slash(
+                interaction, f"/codex continue {task}", echo=True, preface=preface,
+            )
 
         @codex_group.command(name="status", description="查看 Codex 会话状态")
         async def _codex_status(interaction: discord.Interaction):
@@ -3871,24 +3867,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Failed to build Claude continue context", self.name, exc_info=True)
                 return ""
 
-        async def _claude_continue_task_autocomplete(
-            interaction: "discord.Interaction",
-            current: str,
-        ):
-            label = _claude_continue_context_label(interaction)
-            if not label:
-                return []
-            value = current[:100] if str(current or "").strip() else "__hermes_continue_context_hint__"
-            return [discord.app_commands.Choice(name=f"📍 {label}"[:100], value=value)]
-
         @claude_group.command(name="continue", description="继续当前 Claude 会话")
-        @discord.app_commands.describe(task="继续要求（直接输入；候选提示显示当前会话）")
-        @discord.app_commands.autocomplete(task=_claude_continue_task_autocomplete)
+        @discord.app_commands.describe(task="继续要求（直接输入，无需选择）")
         async def _claude_continue(interaction: discord.Interaction, task: str):
-            if task == "__hermes_continue_context_hint__":
-                await interaction.response.send_message("请直接在 task 里输入继续要求，不需要选择提示项。", ephemeral=True)
-                return
-            await self._run_simple_slash(interaction, f"/claude continue {task}", echo=True)
+            # Show the current workspace · session title as a plain context
+            # line above the dispatched task — displayed only, never a
+            # search/filter dropdown. /claude continue always resumes the
+            # currently-selected session, so there is nothing to pick. The
+            # preface is sent by _run_simple_slash *after* defer, so it can
+            # never blow the 3-second interaction deadline.
+            label = _claude_continue_context_label(interaction)
+            preface = f"> 📍 {label}" if label else None
+            await self._run_simple_slash(
+                interaction, f"/claude continue {task}", echo=True, preface=preface,
+            )
 
         @claude_group.command(name="status", description="查看 Claude 会话状态")
         async def _claude_status(interaction: discord.Interaction):
